@@ -19,6 +19,9 @@ from pyrogram.types import (
     ReplyKeyboardMarkup,
 )
 from rubpy import Client as RubikaClient
+from rubpy.crypto import Crypto
+from Crypto.PublicKey import RSA
+from Crypto.Signature import pkcs1_15
 from queue_db import QueueDB
 
 load_dotenv()
@@ -242,7 +245,15 @@ def clear_batch(user_id: int):
 async def rubika_send_code(session_name: str, phone_number: str):
     client = RubikaClient(name=session_name)
     try:
-        return await client.send_code(phone_number)
+        if not hasattr(client, "connection"):
+            await client.connect()
+
+        phone_number = phone_number.strip().replace(" ", "").replace("-", "").replace("+", "")
+        if phone_number.startswith("0"):
+            phone_number = f"98{phone_number[1:]}"
+
+        result = await client.send_code(phone_number=phone_number, send_type="SMS")
+        return result
     finally:
         try:
             await client.disconnect()
@@ -271,10 +282,38 @@ def _deep_find_phone_hash(payload) -> Optional[str]:
 async def rubika_sign_in(session_name: str, phone_number: str, phone_code_hash: str, code: str):
     client = RubikaClient(name=session_name)
     try:
-        try:
-            await client.sign_in(phone_number, phone_code_hash, code)
-        except TypeError:
-            await client.sign_in(phone_number, code)
+        if not hasattr(client, "connection"):
+            await client.connect()
+
+        phone_number = phone_number.strip().replace(" ", "").replace("-", "").replace("+", "")
+        if phone_number.startswith("0"):
+            phone_number = f"98{phone_number[1:]}"
+
+        public_key, private_key = Crypto.create_keys()
+        result = await client.sign_in(
+            phone_code=str(code).strip(),
+            phone_number=phone_number,
+            phone_code_hash=phone_code_hash,
+            public_key=public_key,
+        )
+        status = getattr(result, "status", "")
+        if str(status).upper() != "OK":
+            raise RuntimeError(f"Rubika sign_in failed: {status}")
+
+        auth = Crypto.decrypt_RSA_OAEP(private_key, result.auth)
+        client.key = Crypto.passphrase(auth)
+        client.auth = auth
+        client.decode_auth = Crypto.decode_auth(auth)
+        client.private_key = private_key
+        client.import_key = pkcs1_15.new(RSA.import_key(client.private_key.encode()))
+        client.session.insert(
+            auth=client.auth,
+            guid=result.user.user_guid,
+            user_agent=client.user_agent,
+            phone_number=result.user.phone,
+            private_key=client.private_key,
+        )
+        await client.register_device(device_model=session_name)
         await client.get_me()
     finally:
         try:
