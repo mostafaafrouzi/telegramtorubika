@@ -1,4 +1,4 @@
-# Tele2Rub
+# telegramtorubika
 
 Telegram to Rubika transfer bot with queueing, batch zip/split, yt-dlp download, per-user Rubika sessions, and server installer.
 
@@ -19,8 +19,13 @@ Repository: [github.com/mostafaafrouzi/telegramtorubika](http://github.com/mosta
 
 ```bash
 curl -fsSL http://raw.githubusercontent.com/mostafaafrouzi/telegramtorubika/main/installer.sh -o installer.sh
-sed -i 's/\r$//' installer.sh
 sudo bash installer.sh
+```
+
+One-line update mode:
+
+```bash
+curl -fsSL http://raw.githubusercontent.com/mostafaafrouzi/telegramtorubika/main/installer.sh | sudo bash -s -- --update
 ```
 
 ## Required environment values
@@ -114,9 +119,14 @@ python main.py
   ```bash
   tail -n 200 /tmp/tele2rub-installer.log
   ```
-- If installer script has CRLF issue:
+- Quick installer flags:
   ```bash
-  sed -i 's/\r$//' installer.sh
+  sudo bash installer.sh --install
+  sudo bash installer.sh --update
+  sudo bash installer.sh --uninstall
+  sudo bash installer.sh --backup
+  sudo bash installer.sh --restore
+  sudo bash installer.sh --logs
   ```
 
 ## Credits

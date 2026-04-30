@@ -124,6 +124,8 @@ setup_venv(){
 
 write_env(){
   local dir="$1" api_id="$2" api_hash="$3" bot_token="$4" rubika_session="$5" admin_ids="$6" part_size="$7"
+  local build_version
+  build_version="$(date +%Y.%m.%d-%H%M)"
   cat > "$dir/.env" <<EOF
 API_ID=$api_id
 API_HASH=$api_hash
@@ -131,8 +133,22 @@ BOT_TOKEN=$bot_token
 RUBIKA_SESSION=$rubika_session
 ADMIN_IDS=$admin_ids
 DEFAULT_PART_SIZE_MB=$part_size
+APP_BUILD_VERSION=$build_version
 EOF
   ok "Saved $dir/.env"
+}
+
+update_build_version_in_env(){
+  local dir="$1"
+  local env_file="$dir/.env"
+  [[ -f "$env_file" ]] || return 0
+  local build_version
+  build_version="$(date +%Y.%m.%d-%H%M)"
+  if grep -q '^APP_BUILD_VERSION=' "$env_file"; then
+    sed -i "s/^APP_BUILD_VERSION=.*/APP_BUILD_VERSION=$build_version/" "$env_file"
+  else
+    echo "APP_BUILD_VERSION=$build_version" >> "$env_file"
+  fi
 }
 
 notify_admin(){
@@ -198,7 +214,7 @@ install_flow(){
   setup_venv "$dir" || return 1
   write_env "$dir" "$api_id" "$api_hash" "$bot_token" "$rub_sess" "$admin_ids" "$part_size" || return 1
   create_service "$svc" "$dir" "$user" || return 1
-  notify_admin "$bot_token" "$admin_ids" "Tele2Rub install successful on $(hostname)"
+  notify_admin "$bot_token" "$admin_ids" "telegramtorubika install successful on $(hostname)"
   ok "Install completed."
 }
 
@@ -219,11 +235,12 @@ update_flow(){
   install_deps || return 1
   clone_or_update_repo "$dir" || return 1
   setup_venv "$dir" || return 1
+  update_build_version_in_env "$dir"
   create_service "$svc" "$dir" "$user" || return 1
   if [[ -f "$dir/.env" ]]; then
     bot_token="$(grep '^BOT_TOKEN=' "$dir/.env" | sed 's/^BOT_TOKEN=//' || true)"
     admin_ids="$(grep '^ADMIN_IDS=' "$dir/.env" | sed 's/^ADMIN_IDS=//' || true)"
-    [[ -n "$bot_token" && -n "$admin_ids" ]] && notify_admin "$bot_token" "$admin_ids" "Tele2Rub update successful on $(hostname)"
+    [[ -n "$bot_token" && -n "$admin_ids" ]] && notify_admin "$bot_token" "$admin_ids" "telegramtorubika update successful on $(hostname)"
   fi
   ok "Update completed."
 }
@@ -326,4 +343,23 @@ menu(){
   done
 }
 
+run_quick_flag(){
+  local flag="${1:-}"
+  case "$flag" in
+    --install) install_flow; exit $? ;;
+    --update) update_flow; exit $? ;;
+    --uninstall) uninstall_flow; exit $? ;;
+    --backup) backup_flow; exit $? ;;
+    --restore) restore_flow; exit $? ;;
+    --logs) logs_flow; exit $? ;;
+    "") return 0 ;;
+    *)
+      err "Unknown flag: $flag"
+      echo "Usage: bash installer.sh [--install|--update|--uninstall|--backup|--restore|--logs]"
+      exit 1
+      ;;
+  esac
+}
+
+run_quick_flag "${1:-}"
 menu

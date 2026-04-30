@@ -29,7 +29,7 @@ load_dotenv()
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "").strip()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-APP_VERSION = "v0.4.0"
+APP_VERSION = os.getenv("APP_BUILD_VERSION", "telegramtorubika-dev")
 
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
@@ -65,11 +65,10 @@ app.set_parse_mode(ParseMode.MARKDOWN)
 MAIN_MENU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton("اتصال روبیکا"), KeyboardButton("وضعیت روبیکا")],
-        [KeyboardButton("شروع بچ"), KeyboardButton("پایان بچ")],
-        [KeyboardButton("دانلود ویدیو"), KeyboardButton("دانلود صوت")],
-        [KeyboardButton("ارسال متن"), KeyboardButton("ارسال لینک")],
+        [KeyboardButton("شروع بچ"), KeyboardButton("پایان بچ"), KeyboardButton("حذف همه")],
+        [KeyboardButton("دانلود ویدیو"), KeyboardButton("دانلود صوت"), KeyboardButton("ارسال لینک")],
+        [KeyboardButton("ارسال متن"), KeyboardButton("منو"), KeyboardButton("/version")],
         [KeyboardButton("حالت مستقیم روشن"), KeyboardButton("حالت مستقیم خاموش")],
-        [KeyboardButton("حذف همه"), KeyboardButton("منو")],
     ],
     resize_keyboard=True,
     one_time_keyboard=False,
@@ -242,7 +241,7 @@ def clear_batch(user_id: int):
     save_batch_sessions(sessions)
 
 
-async def rubika_send_code(session_name: str, phone_number: str):
+async def rubika_send_code(session_name: str, phone_number: str, pass_key: str = ""):
     client = RubikaClient(name=session_name)
     try:
         if not hasattr(client, "connection"):
@@ -252,7 +251,10 @@ async def rubika_send_code(session_name: str, phone_number: str):
         if phone_number.startswith("0"):
             phone_number = f"98{phone_number[1:]}"
 
-        result = await client.send_code(phone_number=phone_number, send_type="SMS")
+        kwargs = {"phone_number": phone_number, "send_type": "SMS"}
+        if pass_key:
+            kwargs["pass_key"] = pass_key
+        result = await client.send_code(**kwargs)
         return result
     finally:
         try:
@@ -262,6 +264,17 @@ async def rubika_send_code(session_name: str, phone_number: str):
 
 
 def _deep_find_phone_hash(payload) -> Optional[str]:
+    if payload is None:
+        return None
+    if hasattr(payload, "phone_code_hash"):
+        value = getattr(payload, "phone_code_hash", None)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    if hasattr(payload, "__dict__"):
+        for value in vars(payload).values():
+            found = _deep_find_phone_hash(value)
+            if found:
+                return found
     if isinstance(payload, dict):
         for key in ("phone_code_hash", "phoneCodeHash", "phone_codeHash", "phone_hash"):
             value = payload.get(key)
@@ -277,6 +290,33 @@ def _deep_find_phone_hash(payload) -> Optional[str]:
             if found:
                 return found
     return None
+
+
+def _deep_find_status(payload) -> str:
+    if payload is None:
+        return ""
+    if hasattr(payload, "status"):
+        value = getattr(payload, "status", "")
+        if value:
+            return str(value)
+    if isinstance(payload, dict):
+        if payload.get("status"):
+            return str(payload.get("status"))
+        for value in payload.values():
+            found = _deep_find_status(value)
+            if found:
+                return found
+    if isinstance(payload, list):
+        for item in payload:
+            found = _deep_find_status(item)
+            if found:
+                return found
+    if hasattr(payload, "__dict__"):
+        for value in vars(payload).values():
+            found = _deep_find_status(value)
+            if found:
+                return found
+    return ""
 
 
 async def rubika_sign_in(session_name: str, phone_number: str, phone_code_hash: str, code: str):
@@ -549,7 +589,7 @@ async def menu_handler(client: Client, message: Message):
 
 @app.on_message(filters.private & filters.command("version"))
 async def version_handler(client: Client, message: Message):
-    await message.reply_text(f"Tele2Rub `{APP_VERSION}`")
+    await message.reply_text(f"telegramtorubika `{APP_VERSION}`")
 
 
 @app.on_message(filters.private & filters.command("rubika_status"))
@@ -1097,14 +1137,51 @@ async def text_handler(client: Client, message: Message):
         try:
             result = await rubika_send_code(session_name, phone)
             phone_hash = _deep_find_phone_hash(result)
+            status = _deep_find_status(result).upper()
+            if status == "SENDPASSKEY":
+                set_state(
+                    user_id,
+                    {
+                        "step": "await_pass_key",
+                        "session_name": session_name,
+                        "phone_number": phone,
+                    },
+                )
+                await message.reply_text("این شماره نیاز به PassKey دارد. PassKey روبیکا را ارسال کن.")
+                return
             if not phone_hash:
-                raise RuntimeError("phone_code_hash پیدا نشد.")
+                raise RuntimeError(f"phone_code_hash پیدا نشد. status={status or 'unknown'}")
             set_state(
                 user_id,
                 {
                     "step": "await_code",
                     "session_name": session_name,
                     "phone_number": phone,
+                    "phone_code_hash": phone_hash,
+                },
+            )
+            await message.reply_text("کد ارسال شد. کد تایید روبیکا را بفرست.")
+        except Exception as e:
+            clear_state(user_id)
+            await message.reply_text(f"خطا در ارسال کد روبیکا: {e}")
+        return
+
+    if state.get("step") == "await_pass_key":
+        pass_key = text.strip()
+        session_name = state.get("session_name", "")
+        phone_number = state.get("phone_number", "")
+        try:
+            result = await rubika_send_code(session_name, phone_number, pass_key=pass_key)
+            phone_hash = _deep_find_phone_hash(result)
+            status = _deep_find_status(result).upper()
+            if not phone_hash:
+                raise RuntimeError(f"phone_code_hash پیدا نشد. status={status or 'unknown'}")
+            set_state(
+                user_id,
+                {
+                    "step": "await_code",
+                    "session_name": session_name,
+                    "phone_number": phone_number,
                     "phone_code_hash": phone_hash,
                 },
             )
