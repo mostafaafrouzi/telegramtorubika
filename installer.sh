@@ -19,8 +19,34 @@ err(){ echo -e "${RED}[ERR]${RESET} $*" | tee -a "$LOG_FILE" >&2; }
 
 run_cmd(){ local d="$1"; shift; info "$d"; "$@" >>"$LOG_FILE" 2>&1 && ok "$d" || { err "$d failed. See $LOG_FILE"; tail -n 40 "$LOG_FILE" || true; return 1; }; }
 pause(){ read -r -p "Press Enter to continue..."; }
-ask(){ local p="$1"; local def="${2:-}"; local v=""; while true; do read -r -p "$p${def:+ [$def]}: " v; v="${v:-$def}"; [[ -n "$v" ]] && { echo "$v"; return; }; warn "Value cannot be empty."; done; }
-ask_yn(){ local p="$1"; local def="${2:-y}"; local v=""; while true; do read -r -p "$p (y/n) [$def]: " v; v="${v:-$def}"; case "${v,,}" in y|yes) return 0;; n|no) return 1;; *) warn "Please choose y or n";; esac; done; }
+ask(){
+  local p="$1"; local def="${2:-}"; local v=""
+  if [[ ! -t 0 ]]; then
+    [[ -n "$def" ]] && { echo "$def"; return; }
+    err "Non-interactive mode نیاز به مقدار پیش‌فرض دارد: $p"
+    exit 1
+  fi
+  while true; do
+    read -r -p "$p${def:+ [$def]}: " v
+    v="${v:-$def}"
+    [[ -n "$v" ]] && { echo "$v"; return; }
+    warn "Value cannot be empty."
+  done
+}
+
+ask_yn(){
+  local p="$1"; local def="${2:-y}"; local v=""
+  if [[ ! -t 0 ]]; then
+    v="$def"
+  else
+    while true; do
+      read -r -p "$p (y/n) [$def]: " v
+      v="${v:-$def}"
+      case "${v,,}" in y|yes) return 0;; n|no) return 1;; *) warn "Please choose y or n";; esac
+    done
+  fi
+  case "${v,,}" in y|yes) return 0;; *) return 1;; esac
+}
 
 ensure_root(){ [[ "$EUID" -eq 0 ]] || { err "Run as root: sudo bash installer.sh"; exit 1; }; }
 os_check(){ [[ -f /etc/os-release ]] || { err "Unsupported OS"; exit 1; }; source /etc/os-release; info "OS: ${PRETTY_NAME:-unknown}"; }
@@ -60,6 +86,13 @@ select_instance(){
     echo "$((i+1))) ${INST_NAMES[$i]}  dir=${INST_DIRS[$i]}  user=${INST_USERS[$i]}"
   done
   echo
+  if [[ ! -t 0 ]]; then
+    SELECTED_NAME="${INST_NAMES[0]}"
+    SELECTED_DIR="${INST_DIRS[0]}"
+    SELECTED_USER="${INST_USERS[0]}"
+    info "Non-interactive mode: auto-selected instance ${SELECTED_NAME}"
+    return 0
+  fi
   local pick
   while true; do
     read -r -p "Choose instance [1-${#INST_NAMES[@]}]: " pick

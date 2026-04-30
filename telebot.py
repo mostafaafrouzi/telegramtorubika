@@ -655,7 +655,7 @@ async def queue_or_confirm(message: Message, task: dict, summary: str):
         task["status_message_id"] = status.id
         pushed = queue.push_task(task)
         await message.reply_text("✅", reply_to_message_id=message.id)
-        await status.edit_text(f"Sent to queue directly.\nJob: `{pushed['job_id']}`")
+        await status.delete()
         return
 
     set_state(
@@ -1305,11 +1305,6 @@ async def text_handler(client: Client, message: Message):
         settings = load_settings()
         task["safe_mode"] = settings.get("safe_mode", False)
         task["zip_password"] = settings.get("zip_password", "")
-        await edit_wizard(
-            state.get("wizard_chat_id", message.chat.id),
-            int(state.get("wizard_message_id", 0) or 0),
-            f"Bundle آماده شد: `{task['zip_name']}`\n\nدر صورت تایید، به روبیکا ارسال می‌شود.",
-        )
         clear_state(user_id)
         clear_batch(user_id)
         await queue_or_confirm(message, task, f"Bundle is ready: `{task['zip_name']}`")

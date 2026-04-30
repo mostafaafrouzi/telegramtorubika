@@ -28,6 +28,8 @@ One-line update mode:
 curl -fsSL http://raw.githubusercontent.com/mostafaafrouzi/telegramtorubika/main/installer.sh | sudo bash -s -- --update
 ```
 
+In non-interactive flag mode, the installer auto-selects the first detected instance.
+
 ## Required environment values
 
 The installer asks for these values:

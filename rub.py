@@ -163,7 +163,10 @@ def send_document(file_path: str, caption: str = "", session_name: Optional[str]
     client = RubikaClient(name=(session_name or SESSION))
 
     try:
-        client.start()
+        try:
+            client.start()
+        except EOFError:
+            raise RuntimeError("Rubika session is not authorized. Reconnect in bot with /rubika_connect")
         me = client.get_me()
         target_guid = getattr(getattr(me, "user", None), "user_guid", None) or TARGET
         return client.send_document(
@@ -417,7 +420,10 @@ def run_ytdlp(task: dict) -> Path:
 def send_text_message(text: str, session_name: Optional[str] = None):
     client = RubikaClient(name=(session_name or SESSION))
     try:
-        client.start()
+        try:
+            client.start()
+        except EOFError:
+            raise RuntimeError("Rubika session is not authorized. Reconnect in bot with /rubika_connect")
         me = client.get_me()
         target_guid = getattr(getattr(me, "user", None), "user_guid", None) or TARGET
         return client.send_message(target_guid, text)
