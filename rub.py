@@ -40,6 +40,7 @@ DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 QUEUE_DIR.mkdir(parents=True, exist_ok=True)
 URL_DIR.mkdir(parents=True, exist_ok=True)
 queue_db = QueueDB()
+TARGET_GUID_CACHE_FILE = QUEUE_DIR / "targets.json"
 
 
 def safe_filename(name: Optional[str]) -> str:
@@ -163,8 +164,10 @@ def send_document(file_path: str, caption: str = "", session_name: Optional[str]
 
     try:
         client.start()
+        me = client.get_me()
+        target_guid = getattr(getattr(me, "user", None), "user_guid", None) or TARGET
         return client.send_document(
-            TARGET,
+            target_guid,
             file_path,
             caption=caption or ""
         )
@@ -415,7 +418,9 @@ def send_text_message(text: str, session_name: Optional[str] = None):
     client = RubikaClient(name=(session_name or SESSION))
     try:
         client.start()
-        return client.send_message(TARGET, text)
+        me = client.get_me()
+        target_guid = getattr(getattr(me, "user", None), "user_guid", None) or TARGET
+        return client.send_message(target_guid, text)
     finally:
         try:
             client.disconnect()

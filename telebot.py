@@ -675,6 +675,20 @@ async def queue_or_confirm(message: Message, task: dict, summary: str):
             ]
         ),
     )
+    
+
+async def safe_delete_user_message(message: Message):
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+async def edit_wizard(chat_id: int, wizard_message_id: int, text: str):
+    try:
+        await app.edit_message_text(chat_id=chat_id, message_id=wizard_message_id, text=text)
+    except Exception:
+        pass
     try:
         with open(FAILED_FILE, "r", encoding="utf-8") as f:
             return sum(1 for line in f if line.strip())
@@ -794,14 +808,16 @@ async def done_batch_handler(client: Client, message: Message):
     if not batch.get("active") or not files:
         await message.reply_text("Batch فعالی پیدا نشد یا فایل ندارد.")
         return
+    wizard = await message.reply_text("نام فایل zip را ارسال کن (بدون پسوند).")
     set_state(
         message.from_user.id,
         {
             "step": "await_zip_name",
             "batch_files": files,
+            "wizard_message_id": wizard.id,
+            "wizard_chat_id": message.chat.id,
         },
     )
-    await message.reply_text("نام فایل zip را ارسال کن (بدون پسوند).")
 
 
 @app.on_message(filters.private & filters.command("yt"))
@@ -1128,7 +1144,39 @@ async def text_handler(client: Client, message: Message):
         await direct_mode_handler(client, message)
         return
     if mapped in {"/yt", "/ytaudio", "/sendtext", "/sendlink"}:
-        await message.reply_text(f"Use `{mapped} <value>`")
+        prompt_map = {
+            "/yt": ("await_yt_url_input", "لینک ویدیو را ارسال کن."),
+            "/ytaudio": ("await_ytaudio_url_input", "لینک صوت را ارسال کن."),
+            "/sendtext": ("await_sendtext_input", "متن را ارسال کن."),
+            "/sendlink": ("await_sendlink_input", "لینک را ارسال کن."),
+        }
+        step, prompt = prompt_map[mapped]
+        set_state(user_id, {"step": step})
+        await message.reply_text(prompt)
+        return
+
+    if state.get("step") == "await_sendtext_input":
+        set_state(user_id, {})
+        message.text = f"/sendtext {text}"
+        await send_text_handler(client, message)
+        return
+
+    if state.get("step") == "await_sendlink_input":
+        set_state(user_id, {})
+        message.text = f"/sendlink {text}"
+        await send_link_handler(client, message)
+        return
+
+    if state.get("step") == "await_yt_url_input":
+        set_state(user_id, {})
+        message.text = f"/yt {text}"
+        await yt_video_handler(client, message)
+        return
+
+    if state.get("step") == "await_ytaudio_url_input":
+        set_state(user_id, {})
+        message.text = f"/ytaudio {text}"
+        await yt_audio_handler(client, message)
         return
 
     if state.get("step") == "await_phone":
@@ -1215,15 +1263,22 @@ async def text_handler(client: Client, message: Message):
 
     if state.get("step") == "await_zip_name":
         zip_name = safe_filename(text.strip() or "bundle")
+        await safe_delete_user_message(message)
+        await edit_wizard(
+            state.get("wizard_chat_id", message.chat.id),
+            int(state.get("wizard_message_id", 0) or 0),
+            "سایز هر پارت (MB) را بفرست. مثال: 1900",
+        )
         set_state(
             user_id,
             {
                 "step": "await_part_mb",
                 "zip_name": zip_name,
                 "batch_files": state.get("batch_files", []),
+                "wizard_message_id": state.get("wizard_message_id"),
+                "wizard_chat_id": state.get("wizard_chat_id"),
             },
         )
-        await message.reply_text("سایز هر پارت (MB) را بفرست. مثال: 1900")
         return
 
     if state.get("step") == "await_part_mb":
@@ -1235,6 +1290,7 @@ async def text_handler(client: Client, message: Message):
         if part_mb < 50:
             await message.reply_text("حداقل سایز پارت 50MB است.")
             return
+        await safe_delete_user_message(message)
         files = state.get("batch_files", [])
         session_name = get_user_session(user_id)
         task = {
@@ -1249,6 +1305,11 @@ async def text_handler(client: Client, message: Message):
         settings = load_settings()
         task["safe_mode"] = settings.get("safe_mode", False)
         task["zip_password"] = settings.get("zip_password", "")
+        await edit_wizard(
+            state.get("wizard_chat_id", message.chat.id),
+            int(state.get("wizard_message_id", 0) or 0),
+            f"Bundle آماده شد: `{task['zip_name']}`\n\nدر صورت تایید، به روبیکا ارسال می‌شود.",
+        )
         clear_state(user_id)
         clear_batch(user_id)
         await queue_or_confirm(message, task, f"Bundle is ready: `{task['zip_name']}`")
@@ -1278,26 +1339,24 @@ async def text_handler(client: Client, message: Message):
         )
         return
 
+    if is_direct_mode(user_id):
+        session_name = get_user_session(user_id)
+        if not session_name:
+            await message.reply_text("برای حالت مستقیم اول /rubika_connect بزن.")
+            return
+        direct_task = {
+            "type": "text_message",
+            "text": text,
+            "rubika_session": session_name,
+        }
+        await queue_or_confirm(message, direct_task, "Direct mode")
+        return
+
     url = extract_first_url(text)
 
     if not url or not is_direct_url(url):
         return
-
-    session_name = get_user_session(user_id)
-    if not session_name:
-        await message.reply_text("برای ارسال به روبیکا اول /rubika_connect بزن.")
-        return
-
-    settings = load_settings()
-
-    task = {
-        "type": "direct_url",
-        "url": url,
-        "safe_mode": settings.get("safe_mode", False),
-        "zip_password": settings.get("zip_password", ""),
-        "rubika_session": session_name,
-    }
-    await queue_or_confirm(message, task, "Direct URL prepared.")
+    await message.reply_text("برای لینک از دکمه/دستور «ارسال لینک» استفاده کن.")
 
     
 @app.on_message(
@@ -1357,12 +1416,10 @@ async def media_handler(client: Client, message: Message):
             files.append(str(downloaded_path))
             batch["files"] = files
             set_batch(user_id, batch)
-            await status.edit_text(
-                f"فایل برای batch ذخیره شد.\n"
-                f"فایل: `{download_name}`\n"
-                f"تعداد فایل‌های batch: `{len(files)}`\n"
-                f"برای پایان: `/done`"
-            )
+            try:
+                await status.delete()
+            except Exception:
+                pass
             return
 
         task = {
