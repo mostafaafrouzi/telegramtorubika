@@ -1,6 +1,6 @@
 # telegramtorubika
 
-Telegram to Rubika transfer bot with queueing, batch zip/split, yt-dlp download, per-user Rubika sessions, and server installer.
+Telegram to Rubika transfer bot with queueing, batch zip/split, per-user Rubika sessions, and server installer.
 
 Repository: [github.com/mostafaafrouzi/telegramtorubika](http://github.com/mostafaafrouzi/telegramtorubika)
 
@@ -9,7 +9,6 @@ Repository: [github.com/mostafaafrouzi/telegramtorubika](http://github.com/mosta
 - Per-user Rubika connection from Telegram bot (`/rubika_connect`)
 - Queue-based processing (SQLite)
 - Batch mode: collect many files, zip, split parts
-- yt-dlp video/audio download with quality selection
 - Direct URL download
 - Safe mode (zip with password)
 - Direct mode (send everything immediately to queue)
@@ -121,6 +120,39 @@ python main.py
   ```bash
   tail -n 200 /tmp/tele2rub-installer.log
   ```
+- Installer JSON logs (machine-readable for deeper debugging):
+  ```bash
+  tail -n 200 /tmp/tele2rub-installer.jsonl
+  ```
+- Bot event logs:
+  ```bash
+  tail -n 200 /opt/tele2rub/queue/bot_events.jsonl
+  ```
+- Worker event logs:
+  ```bash
+  tail -n 200 /opt/tele2rub/queue/worker_events.jsonl
+  ```
+- Analyze one specific job by id:
+  ```bash
+  JOB_ID=YOUR_JOB_ID
+  rg "$JOB_ID|task_queued|task_started|task_done|task_failed|task_requeued" /opt/tele2rub/queue/bot_events.jsonl /opt/tele2rub/queue/worker_events.jsonl
+  ```
+- Human-readable analyzer (from project root):
+  ```bash
+  python3 log_analyzer.py --job-id YOUR_JOB_ID --queue-dir /opt/tele2rub/queue
+  ```
+- JSON analyzer output (for automation or sharing):
+  ```bash
+  python3 log_analyzer.py --job-id YOUR_JOB_ID --queue-dir /opt/tele2rub/queue --json
+  ```
+- Brief one-line summary:
+  ```bash
+  python3 log_analyzer.py --job-id YOUR_JOB_ID --queue-dir /opt/tele2rub/queue --brief
+  ```
+- Live follow mode (waits for new worker events of one job):
+  ```bash
+  python3 log_analyzer.py --job-id YOUR_JOB_ID --queue-dir /opt/tele2rub/queue --follow
+  ```
 - Quick installer flags:
   ```bash
   sudo bash installer.sh --install
@@ -130,6 +162,14 @@ python main.py
   sudo bash installer.sh --restore
   sudo bash installer.sh --logs
   ```
+
+### Log interpretation checklist
+
+- Successful flow: `task_queued` -> `task_started` -> `task_done`
+- Failed flow: `task_queued` -> `task_started` -> `task_failed`
+- Requeue flow (network degradation): `task_failed` + `task_requeued` with a `new_job_id`
+- Rubika auth issues: check `rubika_connect_failed` in bot log before re-testing queue jobs
+- Performance timing: check `duration_ms` in `task_done` and phase events like `bundle_zip_done`, `split_done`, `upload_part_done`
 
 ## Credits
 

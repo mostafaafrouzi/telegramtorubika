@@ -2,7 +2,6 @@ import asyncio
 import json
 import os
 import re
-import subprocess
 import time
 from pathlib import Path
 from typing import Optional
@@ -41,6 +40,7 @@ USER_STATES_FILE = QUEUE_DIR / "user_states.json"
 BATCH_FILE = QUEUE_DIR / "batch_sessions.json"
 NETWORK_FILE = QUEUE_DIR / "network.json"
 FAILED_FILE = QUEUE_DIR / "failed.jsonl"
+BOT_LOG_FILE = QUEUE_DIR / "bot_events.jsonl"
 
 ADMIN_IDS = {
     int(x.strip())
@@ -64,20 +64,39 @@ app.set_parse_mode(ParseMode.MARKDOWN)
 
 MAIN_MENU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton("اتصال روبیکا"), KeyboardButton("وضعیت روبیکا")],
-        [KeyboardButton("شروع بچ"), KeyboardButton("پایان بچ"), KeyboardButton("حذف همه")],
-        [KeyboardButton("دانلود ویدیو"), KeyboardButton("دانلود صوت"), KeyboardButton("ارسال لینک")],
-        [KeyboardButton("ارسال متن"), KeyboardButton("منو"), KeyboardButton("/version")],
-        [KeyboardButton("حالت مستقیم روشن"), KeyboardButton("حالت مستقیم خاموش")],
+        [KeyboardButton("منوی اتصال"), KeyboardButton("منوی فایل‌ها")],
+        [KeyboardButton("منوی تنظیمات"), KeyboardButton("راهنما")],
+        [KeyboardButton("وضعیت شبکه"), KeyboardButton("پنل ادمین")],
+        [KeyboardButton("/version")],
     ],
     resize_keyboard=True,
     one_time_keyboard=False,
 )
 
-DIRECT_MENU = ReplyKeyboardMarkup(
+RUBIKA_MENU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton("حالت مستقیم خاموش")],
-        [KeyboardButton("منو")],
+        [KeyboardButton("اتصال روبیکا"), KeyboardButton("وضعیت روبیکا")],
+        [KeyboardButton("بازگشت به منوی اصلی")],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=False,
+)
+
+FILES_MENU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton("شروع بچ"), KeyboardButton("پایان بچ")],
+        [KeyboardButton("ارسال لینک"), KeyboardButton("ارسال متن")],
+        [KeyboardButton("حذف همه")],
+        [KeyboardButton("بازگشت به منوی اصلی")],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=False,
+)
+
+SETTINGS_MENU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton("حالت مستقیم روشن"), KeyboardButton("حالت مستقیم خاموش")],
+        [KeyboardButton("بازگشت به منوی اصلی")],
     ],
     resize_keyboard=True,
     one_time_keyboard=False,
@@ -154,6 +173,19 @@ def load_json(path: Path, default):
 
 def save_json(path: Path, data):
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def log_event(event: str, **kwargs):
+    payload = {
+        "ts": int(time.time()),
+        "event": event,
+        **kwargs,
+    }
+    try:
+        with open(BOT_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
 
 def load_users() -> dict:
@@ -420,43 +452,6 @@ def extract_first_url(text: str) -> Optional[str]:
     return match.group(0) if match else None
 
 
-def inspect_ytdlp_video_formats(url: str) -> tuple[str, list[dict]]:
-    cmd = ["yt-dlp", "-J", "--no-playlist", url]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.strip() or "yt-dlp metadata failed")
-    payload = json.loads(proc.stdout or "{}")
-    title = payload.get("title") or "untitled"
-    options = []
-    for item in payload.get("formats", []):
-        fmt_id = str(item.get("format_id", "")).strip()
-        height = item.get("height")
-        ext = item.get("ext", "")
-        vcodec = item.get("vcodec")
-        if not fmt_id or not height:
-            continue
-        if vcodec == "none":
-            continue
-        size = item.get("filesize") or item.get("filesize_approx") or 0
-        options.append(
-            {
-                "format_id": fmt_id,
-                "height": int(height),
-                "ext": ext,
-                "size": int(size),
-            }
-        )
-    seen = set()
-    deduped = []
-    for opt in sorted(options, key=lambda x: (-x["height"], x["size"] or 0)):
-        key = (opt["height"], opt["ext"])
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(opt)
-    return title, deduped[:8]
-
-
 def progress_bar(percent: float, length: int = 12) -> str:
     filled = int(length * percent / 100)
     return "█" * filled + "░" * (length - filled)
@@ -555,35 +550,62 @@ async def start_handler(client: Client, message: Message):
         "برای هر کاربر، روبیکا به‌صورت جداگانه متصل می‌شود.\n"
         "ابتدا این دستور را بزن:\n"
         "`/rubika_connect`\n\n"
-        "راهنمای سریع:\n"
-        "`/menu` نمایش منو\n"
-        "`/newbatch` شروع دریافت چندفایل برای zip\n"
-        "`/done` پایان batch و ساخت zip چندپارت\n"
-        "`/yt <url>` دانلود ویدئو با yt-dlp\n"
-        "`/ytaudio <url>` دانلود موسیقی با yt-dlp\n"
-        "`/safemode on|off`",
+        "از دکمه‌های منو وارد بخش‌های مختلف شو.\n"
+        "`/menu` برای نمایش منوی اصلی",
         reply_markup=MAIN_MENU,
     )
 
 
 @app.on_message(filters.private & filters.command("menu"))
 async def menu_handler(client: Client, message: Message):
-    direct = is_direct_mode(message.from_user.id)
     await message.reply_text(
-        "منو:\n\n"
-        "1) اتصال روبیکا: `/rubika_connect`\n"
-        "2) وضعیت اتصال: `/rubika_status`\n"
-        "3) شروع batch: `/newbatch`\n"
-        "4) پایان batch: `/done`\n"
-        "5) دانلود ویدئو: `/yt <url>`\n"
-        "6) دانلود موسیقی: `/ytaudio <url>`\n"
-        "7) ارسال متن به روبیکا: `/sendtext متن`\n"
-        "8) ارسال لینک به روبیکا: `/sendlink https://...`\n"
-        "9) حذف از صف: `/del <job_id>`\n"
-        "10) پاکسازی صف: `/delall`\n"
-        "11) وضعیت شبکه: `/netstatus`\n"
-        "12) پنل ادمین: `/admin`",
-        reply_markup=DIRECT_MENU if direct else MAIN_MENU,
+        "منوی اصلی:\n"
+        "- منوی اتصال: مدیریت اتصال روبیکا\n"
+        "- منوی فایل‌ها: batch، ارسال متن/لینک، پاکسازی صف\n"
+        "- منوی تنظیمات: حالت مستقیم\n"
+        "- راهنما: نمایش دستورهای اصلی",
+        reply_markup=MAIN_MENU,
+    )
+
+
+@app.on_message(filters.private & filters.command("help"))
+async def help_handler(client: Client, message: Message):
+    await message.reply_text(
+        "راهنمای سریع:\n\n"
+        "منوی اتصال:\n"
+        "- اتصال روبیکا: `/rubika_connect`\n"
+        "- وضعیت روبیکا: `/rubika_status`\n\n"
+        "منوی فایل‌ها:\n"
+        "- شروع بچ: `/newbatch`\n"
+        "- پایان بچ و zip: `/done`\n"
+        "- ارسال متن: `/sendtext متن`\n"
+        "- ارسال لینک: `/sendlink https://...`\n"
+        "- پاکسازی صف: `/delall`\n\n"
+        "منوی تنظیمات:\n"
+        "- حالت مستقیم: `/directmode on|off`\n"
+        "- safe mode: `/safemode on|off`\n\n"
+        "عیب‌یابی:\n"
+        "- وضعیت شبکه: `/netstatus`\n"
+        "- پنل ادمین: `/admin`\n"
+        "- حذف یک job: `/del <job_id>`\n\n"
+        "برای راهنمای تحلیل لاگ: `/loghelp`"
+    )
+
+
+@app.on_message(filters.private & filters.command("loghelp"))
+async def log_help_handler(client: Client, message: Message):
+    await message.reply_text(
+        "راهنمای تحلیل لاگ job:\n\n"
+        "1) ابتدا `job_id` را از پیام Queued بردار.\n"
+        "2) در bot logs دنبال `task_queued` با همان `job_id` بگرد.\n"
+        "3) در worker logs باید به‌ترتیب ببینی:\n"
+        "   `task_started` -> (`task_done` یا `task_failed`).\n"
+        "4) اگر `task_requeued` دیدی، مشکل شبکه/دسترسی بوده و job جدید ساخته شده.\n"
+        "5) برای اتصال روبیکا، eventهای `rubika_connect_ok` یا `rubika_connect_failed` را چک کن.\n\n"
+        "مسیر لاگ‌ها:\n"
+        "- `/opt/tele2rub/queue/bot_events.jsonl`\n"
+        "- `/opt/tele2rub/queue/worker_events.jsonl`\n"
+        "- `/tmp/tele2rub-installer.jsonl`"
     )
 
 
@@ -604,7 +626,15 @@ async def rubika_status_handler(client: Client, message: Message):
 @app.on_message(filters.private & filters.command("rubika_connect"))
 async def rubika_connect_handler(client: Client, message: Message):
     user_id = message.from_user.id
+    current_session = get_user_session(user_id)
+    if current_session:
+        await message.reply_text(
+            f"اکانت روبیکا از قبل متصل است.\n"
+            f"session: `{current_session}`\n\n"
+            f"برای اتصال مجدد، شماره جدید را ارسال کن."
+        )
     set_state(user_id, {"step": "await_phone"})
+    log_event("rubika_connect_started", user_id=user_id)
     await message.reply_text(
         "شماره روبیکا را با پیش‌شماره کشور ارسال کن.\n"
         "مثال: `98912xxxxxxx`"
@@ -620,11 +650,11 @@ async def direct_mode_handler(client: Client, message: Message):
     action = args[1].strip().lower()
     if action == "on":
         set_direct_mode(message.from_user.id, True)
-        await message.reply_text("Direct mode enabled.", reply_markup=DIRECT_MENU)
+        await message.reply_text("حالت مستقیم فعال شد.", reply_markup=SETTINGS_MENU)
         return
     if action == "off":
         set_direct_mode(message.from_user.id, False)
-        await message.reply_text("Direct mode disabled.", reply_markup=MAIN_MENU)
+        await message.reply_text("حالت مستقیم غیرفعال شد.", reply_markup=SETTINGS_MENU)
         return
     await message.reply_text("Use: /directmode on یا /directmode off")
 
@@ -645,6 +675,11 @@ async def netstatus_handler(client: Client, message: Message):
 def failed_count() -> int:
     if not FAILED_FILE.exists():
         return 0
+    try:
+        with open(FAILED_FILE, "r", encoding="utf-8") as f:
+            return sum(1 for line in f if line.strip())
+    except Exception:
+        return 0
 
 
 async def queue_or_confirm(message: Message, task: dict, summary: str):
@@ -654,8 +689,14 @@ async def queue_or_confirm(message: Message, task: dict, summary: str):
         task["chat_id"] = message.chat.id
         task["status_message_id"] = status.id
         pushed = queue.push_task(task)
-        await message.reply_text("✅", reply_to_message_id=message.id)
-        await status.delete()
+        log_event(
+            "task_queued",
+            user_id=user_id,
+            job_id=pushed.get("job_id"),
+            task_type=task.get("type"),
+            direct_mode=True,
+        )
+        await status.edit_text(f"Queued.\nJob: `{pushed['job_id']}`")
         return
 
     set_state(
@@ -675,6 +716,11 @@ async def queue_or_confirm(message: Message, task: dict, summary: str):
             ]
         ),
     )
+    log_event(
+        "task_confirm_requested",
+        user_id=user_id,
+        task_type=task.get("type"),
+    )
     
 
 async def safe_delete_user_message(message: Message):
@@ -689,11 +735,6 @@ async def edit_wizard(chat_id: int, wizard_message_id: int, text: str):
         await app.edit_message_text(chat_id=chat_id, message_id=wizard_message_id, text=text)
     except Exception:
         pass
-    try:
-        with open(FAILED_FILE, "r", encoding="utf-8") as f:
-            return sum(1 for line in f if line.strip())
-    except Exception:
-        return 0
 
 
 @app.on_message(filters.private & filters.command("admin"))
@@ -820,131 +861,11 @@ async def done_batch_handler(client: Client, message: Message):
     )
 
 
-@app.on_message(filters.private & filters.command("yt"))
-async def yt_video_handler(client: Client, message: Message):
-    session_name = get_user_session(message.from_user.id)
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await message.reply_text("فرمت درست: `/yt <url>`")
-        return
-    url = extract_first_url(parts[1])
-    if not url:
-        await message.reply_text("لینک نامعتبر است.")
-        return
-    try:
-        title, options = inspect_ytdlp_video_formats(url)
-    except Exception as e:
-        await message.reply_text(f"خطا در خواندن کیفیت‌ها: {e}")
-        return
-    if not options:
-        await message.reply_text("کیفیت قابل انتخاب پیدا نشد.")
-        return
-    lines = [f"عنوان: {title}", "", "کیفیت‌های در دسترس:"]
-    rows = []
-    for idx, opt in enumerate(options, start=1):
-        size_text = pretty_size(opt["size"]) if opt["size"] else "نامشخص"
-        lines.append(f"{idx}) {opt['height']}p ({opt['ext']}) ~ {size_text}")
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    f"{opt['height']}p {opt['ext']}",
-                    callback_data=f"ytv:{idx}",
-                )
-            ]
-        )
-    lines.append("")
-    lines.append("از دکمه‌ها کیفیت را انتخاب کن.")
-    set_state(
-        message.from_user.id,
-        {
-            "step": "await_yt_video_choice",
-            "url": url,
-            "options": options,
-            "chat_id": message.chat.id,
-            "rubika_session": session_name,
-        },
-    )
-    await message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
-
-
-@app.on_message(filters.private & filters.command("ytaudio"))
-async def yt_audio_handler(client: Client, message: Message):
-    session_name = get_user_session(message.from_user.id)
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await message.reply_text("فرمت درست: `/ytaudio <url>`")
-        return
-    url = extract_first_url(parts[1])
-    if not url:
-        await message.reply_text("لینک نامعتبر است.")
-        return
-    rows = [
-        [InlineKeyboardButton("320kbps", callback_data="yta:320")],
-        [InlineKeyboardButton("192kbps", callback_data="yta:192")],
-        [InlineKeyboardButton("128kbps", callback_data="yta:128")],
-    ]
-    set_state(
-        message.from_user.id,
-        {
-            "step": "await_yt_audio_quality",
-            "url": url,
-            "chat_id": message.chat.id,
-            "rubika_session": session_name,
-        },
-    )
-    await message.reply_text(
-        "کیفیت صوت را انتخاب کن:",
-        reply_markup=InlineKeyboardMarkup(rows),
-    )
-
-
 @app.on_callback_query()
 async def callback_handler(client: Client, callback_query):
     user_id = callback_query.from_user.id
     data = callback_query.data or ""
     state = get_state(user_id)
-
-    if data.startswith("ytv:") and state.get("step") == "await_yt_video_choice":
-        try:
-            selected = int(data.split(":", 1)[1])
-        except Exception:
-            await callback_query.answer("انتخاب نامعتبر", show_alert=True)
-            return
-        options = state.get("options", [])
-        if selected < 1 or selected > len(options):
-            await callback_query.answer("شماره خارج از بازه", show_alert=True)
-            return
-        pick = options[selected - 1]
-        task = {
-            "type": "ytdlp_url",
-            "url": state.get("url", ""),
-            "chat_id": state.get("chat_id") or callback_query.message.chat.id,
-            "mode": "video",
-            "format_id": pick.get("format_id"),
-            "rubika_session": state.get("rubika_session"),
-        }
-        clear_state(user_id)
-        await queue_or_confirm(callback_query.message, task, f"Selected quality: {pick.get('height')}p")
-        await callback_query.answer("ثبت شد")
-        return
-
-    if data.startswith("yta:") and state.get("step") == "await_yt_audio_quality":
-        quality = data.split(":", 1)[1]
-        if quality not in {"128", "192", "320"}:
-            await callback_query.answer("کیفیت نامعتبر", show_alert=True)
-            return
-        task = {
-            "type": "ytdlp_url",
-            "url": state.get("url", ""),
-            "chat_id": state.get("chat_id") or callback_query.message.chat.id,
-            "mode": "audio",
-            "audio_quality": quality,
-            "rubika_session": state.get("rubika_session"),
-        }
-        clear_state(user_id)
-        await queue_or_confirm(callback_query.message, task, f"Selected audio quality: {quality}kbps")
-        await callback_query.answer("ثبت شد")
-        return
 
     if data == "confirm_send" and state.get("step") == "await_send_confirm":
         task = state.get("pending_task")
@@ -956,12 +877,20 @@ async def callback_handler(client: Client, callback_query):
         task["status_message_id"] = status.id
         task = queue.push_task(task)
         clear_state(user_id)
+        log_event(
+            "task_queued",
+            user_id=user_id,
+            job_id=task.get("job_id"),
+            task_type=task.get("type"),
+            direct_mode=False,
+        )
         await status.edit_text(f"Queued.\nJob: `{task['job_id']}`")
         await callback_query.answer("Queued")
         return
 
     if data == "cancel_send" and state.get("step") == "await_send_confirm":
         clear_state(user_id)
+        log_event("task_confirm_cancelled", user_id=user_id)
         await callback_query.message.reply_text("Canceled.")
         await callback_query.answer("Canceled")
         return
@@ -1082,7 +1011,7 @@ async def delete_one_handler(client: Client, message: Message):
         return
 
 
-@app.on_message(filters.private & filters.text & ~filters.command(["start", "menu", "version", "rubika_status", "rubika_connect", "directmode", "netstatus", "admin", "safemode", "del", "delall", "newbatch", "done", "yt", "ytaudio", "sendtext", "sendlink"]))
+@app.on_message(filters.private & filters.text & ~filters.command(["start", "menu", "help", "loghelp", "version", "rubika_status", "rubika_connect", "directmode", "netstatus", "admin", "safemode", "del", "delall", "newbatch", "done", "sendtext", "sendlink"]))
 async def text_handler(client: Client, message: Message):
     global waiting_for_zip_password
 
@@ -1093,6 +1022,17 @@ async def text_handler(client: Client, message: Message):
     button_map = {
         "menu": "/menu",
         "منو": "/menu",
+        "help": "/help",
+        "راهنما": "/help",
+        "راهنمای لاگ": "/loghelp",
+        "back to main menu": "/menu",
+        "بازگشت به منوی اصلی": "/menu",
+        "rubika menu": "/show_rubika_menu",
+        "منوی اتصال": "/show_rubika_menu",
+        "files menu": "/show_files_menu",
+        "منوی فایل‌ها": "/show_files_menu",
+        "settings menu": "/show_settings_menu",
+        "منوی تنظیمات": "/show_settings_menu",
         "rubika connect": "/rubika_connect",
         "اتصال روبیکا": "/rubika_connect",
         "rubika status": "/rubika_status",
@@ -1101,10 +1041,6 @@ async def text_handler(client: Client, message: Message):
         "شروع بچ": "/newbatch",
         "done batch": "/done",
         "پایان بچ": "/done",
-        "download video": "/yt",
-        "دانلود ویدیو": "/yt",
-        "download audio": "/ytaudio",
-        "دانلود صوت": "/ytaudio",
         "send text": "/sendtext",
         "ارسال متن": "/sendtext",
         "send link": "/sendlink",
@@ -1119,6 +1055,21 @@ async def text_handler(client: Client, message: Message):
     mapped = button_map.get(text.strip().lower())
     if mapped == "/menu":
         await menu_handler(client, message)
+        return
+    if mapped == "/help":
+        await help_handler(client, message)
+        return
+    if mapped == "/loghelp":
+        await log_help_handler(client, message)
+        return
+    if mapped == "/show_rubika_menu":
+        await message.reply_text("منوی اتصال روبیکا", reply_markup=RUBIKA_MENU)
+        return
+    if mapped == "/show_files_menu":
+        await message.reply_text("منوی فایل‌ها و صف", reply_markup=FILES_MENU)
+        return
+    if mapped == "/show_settings_menu":
+        await message.reply_text("منوی تنظیمات", reply_markup=SETTINGS_MENU)
         return
     if mapped == "/rubika_connect":
         await rubika_connect_handler(client, message)
@@ -1143,10 +1094,8 @@ async def text_handler(client: Client, message: Message):
         message.text = "/directmode off"
         await direct_mode_handler(client, message)
         return
-    if mapped in {"/yt", "/ytaudio", "/sendtext", "/sendlink"}:
+    if mapped in {"/sendtext", "/sendlink"}:
         prompt_map = {
-            "/yt": ("await_yt_url_input", "لینک ویدیو را ارسال کن."),
-            "/ytaudio": ("await_ytaudio_url_input", "لینک صوت را ارسال کن."),
             "/sendtext": ("await_sendtext_input", "متن را ارسال کن."),
             "/sendlink": ("await_sendlink_input", "لینک را ارسال کن."),
         }
@@ -1165,18 +1114,6 @@ async def text_handler(client: Client, message: Message):
         set_state(user_id, {})
         message.text = f"/sendlink {text}"
         await send_link_handler(client, message)
-        return
-
-    if state.get("step") == "await_yt_url_input":
-        set_state(user_id, {})
-        message.text = f"/yt {text}"
-        await yt_video_handler(client, message)
-        return
-
-    if state.get("step") == "await_ytaudio_url_input":
-        set_state(user_id, {})
-        message.text = f"/ytaudio {text}"
-        await yt_audio_handler(client, message)
         return
 
     if state.get("step") == "await_phone":
@@ -1256,8 +1193,10 @@ async def text_handler(client: Client, message: Message):
             save_users(users)
             clear_state(user_id)
             await message.reply_text("روبیکا با موفقیت متصل شد ✅")
+            log_event("rubika_connect_ok", user_id=user_id, session=session_name)
         except Exception as e:
             clear_state(user_id)
+            log_event("rubika_connect_failed", user_id=user_id, error=str(e))
             await message.reply_text(f"کد تایید نامعتبر یا خطای ورود: {e}")
         return
 
@@ -1299,7 +1238,6 @@ async def text_handler(client: Client, message: Message):
             "zip_name": state.get("zip_name", "bundle"),
             "part_size_mb": part_mb,
             "chat_id": message.chat.id,
-            "status_message_id": message.id,
             "rubika_session": session_name,
         }
         settings = load_settings()
@@ -1308,10 +1246,6 @@ async def text_handler(client: Client, message: Message):
         clear_state(user_id)
         clear_batch(user_id)
         await queue_or_confirm(message, task, f"Bundle is ready: `{task['zip_name']}`")
-        return
-
-    if state.get("step") in {"await_yt_video_choice", "await_yt_audio_quality"}:
-        await message.reply_text("برای انتخاب کیفیت از دکمه‌های پیام قبلی استفاده کن.")
         return
 
     if waiting_for_zip_password:
@@ -1432,8 +1366,16 @@ async def media_handler(client: Client, message: Message):
             f"File ready: `{download_name}` ({pretty_size(file_size)})\nWaiting for your confirmation."
         )
         await queue_or_confirm(message, task, f"File prepared: `{download_name}`")
+        log_event(
+            "media_prepared",
+            user_id=user_id,
+            file_name=download_name,
+            file_size=file_size,
+            task_type="local_file",
+        )
 
     except Exception as e:
+        log_event("media_prepare_failed", user_id=user_id, error=str(e))
         await status.edit_text(f"خطا: {str(e)}")
 
 def clear_old_status():

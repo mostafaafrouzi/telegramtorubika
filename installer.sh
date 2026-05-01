@@ -7,17 +7,64 @@ DEFAULT_INSTALL_DIR="/opt/tele2rub"
 DEFAULT_SERVICE_NAME="tele2rub"
 DEFAULT_BACKUP_DIR="/opt/tele2rub-backups"
 LOG_FILE="/tmp/tele2rub-installer.log"
+LOG_JSON_FILE="/tmp/tele2rub-installer.jsonl"
 
 BLUE="\033[34m"; GREEN="\033[32m"; YELLOW="\033[33m"; RED="\033[31m"; RESET="\033[0m"
 mkdir -p "$(dirname "$LOG_FILE")" >/dev/null 2>&1 || true
 : > "$LOG_FILE"
+: > "$LOG_JSON_FILE"
 
-info(){ echo -e "${BLUE}[INFO]${RESET} $*" | tee -a "$LOG_FILE"; }
-ok(){ echo -e "${GREEN}[OK]${RESET} $*" | tee -a "$LOG_FILE"; }
-warn(){ echo -e "${YELLOW}[WARN]${RESET} $*" | tee -a "$LOG_FILE"; }
-err(){ echo -e "${RED}[ERR]${RESET} $*" | tee -a "$LOG_FILE" >&2; }
+json_escape(){
+  local s="${1:-}"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  echo "$s"
+}
 
-run_cmd(){ local d="$1"; shift; info "$d"; "$@" >>"$LOG_FILE" 2>&1 && ok "$d" || { err "$d failed. See $LOG_FILE"; tail -n 40 "$LOG_FILE" || true; return 1; }; }
+log_event(){
+  local level="${1:-INFO}"; shift || true
+  local event="${1:-message}"; shift || true
+  local message="${*:-}"
+  local ts
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf '{"ts":"%s","level":"%s","event":"%s","message":"%s"}\n' \
+    "$(json_escape "$ts")" \
+    "$(json_escape "$level")" \
+    "$(json_escape "$event")" \
+    "$(json_escape "$message")" >> "$LOG_JSON_FILE"
+}
+
+info(){ echo -e "${BLUE}[INFO]${RESET} $*" | tee -a "$LOG_FILE"; log_event "INFO" "message" "$*"; }
+ok(){ echo -e "${GREEN}[OK]${RESET} $*" | tee -a "$LOG_FILE"; log_event "OK" "message" "$*"; }
+warn(){ echo -e "${YELLOW}[WARN]${RESET} $*" | tee -a "$LOG_FILE"; log_event "WARN" "message" "$*"; }
+err(){ echo -e "${RED}[ERR]${RESET} $*" | tee -a "$LOG_FILE" >&2; log_event "ERR" "message" "$*"; }
+
+run_cmd(){
+  local d="$1"; shift
+  local started_at ended_at elapsed rc cmd_text
+  started_at="$(date +%s)"
+  cmd_text="$*"
+  info "$d"
+  log_event "INFO" "command_start" "desc=$d cmd=$cmd_text"
+  set +e
+  "$@" >>"$LOG_FILE" 2>&1
+  rc=$?
+  set -e
+  ended_at="$(date +%s)"
+  elapsed=$((ended_at - started_at))
+  if [[ $rc -eq 0 ]]; then
+    ok "$d"
+    log_event "OK" "command_end" "desc=$d cmd=$cmd_text exit_code=$rc elapsed_sec=$elapsed"
+    return 0
+  fi
+  err "$d failed. See $LOG_FILE"
+  log_event "ERR" "command_end" "desc=$d cmd=$cmd_text exit_code=$rc elapsed_sec=$elapsed"
+  tail -n 40 "$LOG_FILE" || true
+  return 1
+}
 pause(){ read -r -p "Press Enter to continue..."; }
 ask(){
   local p="$1"; local def="${2:-}"; local v=""
@@ -221,6 +268,16 @@ EOF
   run_cmd "service status" systemctl --no-pager --full status "$name"
 }
 
+post_deploy_health_check(){
+  local svc="$1" dir="$2"
+  info "Running post-deploy health checks..."
+  run_cmd "service is-active check" systemctl is-active --quiet "$svc"
+  run_cmd "service is-enabled check" systemctl is-enabled --quiet "$svc"
+  run_cmd "python syntax smoke check" "$dir/venv/bin/python" -m py_compile "$dir/main.py" "$dir/telebot.py" "$dir/rub.py" "$dir/queue_db.py"
+  ok "Health check passed for service=$svc dir=$dir"
+  log_event "OK" "health_check_passed" "service=$svc dir=$dir"
+}
+
 show_requirements_reminder(){
   echo "Before installation, prepare these values:"
   echo "- Telegram API_ID"
@@ -247,6 +304,7 @@ install_flow(){
   setup_venv "$dir" || return 1
   write_env "$dir" "$api_id" "$api_hash" "$bot_token" "$rub_sess" "$admin_ids" "$part_size" || return 1
   create_service "$svc" "$dir" "$user" || return 1
+  post_deploy_health_check "$svc" "$dir" || return 1
   notify_admin "$bot_token" "$admin_ids" "telegramtorubika install successful on $(hostname)"
   ok "Install completed."
 }
@@ -270,6 +328,7 @@ update_flow(){
   setup_venv "$dir" || return 1
   update_build_version_in_env "$dir"
   create_service "$svc" "$dir" "$user" || return 1
+  post_deploy_health_check "$svc" "$dir" || return 1
   if [[ -f "$dir/.env" ]]; then
     bot_token="$(grep '^BOT_TOKEN=' "$dir/.env" | sed 's/^BOT_TOKEN=//' || true)"
     admin_ids="$(grep '^ADMIN_IDS=' "$dir/.env" | sed 's/^ADMIN_IDS=//' || true)"
@@ -345,6 +404,8 @@ logs_flow(){
   else
     svc="$(ask "Systemd service name" "$DEFAULT_SERVICE_NAME")"
   fi
+  info "Installer logs: $LOG_FILE"
+  info "Installer JSON logs: $LOG_JSON_FILE"
   journalctl -u "$svc" -f -n 120
 }
 

@@ -2,7 +2,6 @@ import os
 import re
 import json
 import time
-import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -27,6 +26,7 @@ FAILED_FILE = QUEUE_DIR / "failed.jsonl"
 STATUS_FILE = QUEUE_DIR / "status.jsonl"
 URL_DIR = DOWNLOAD_DIR / "url"
 NETWORK_FILE = QUEUE_DIR / "network.json"
+WORKER_LOG_FILE = QUEUE_DIR / "worker_events.jsonl"
 
 MAX_RETRIES = 5
 UPLOAD_TIMEOUT = 1800
@@ -41,6 +41,19 @@ QUEUE_DIR.mkdir(parents=True, exist_ok=True)
 URL_DIR.mkdir(parents=True, exist_ok=True)
 queue_db = QueueDB()
 TARGET_GUID_CACHE_FILE = QUEUE_DIR / "targets.json"
+
+
+def worker_log(event: str, **kwargs):
+    payload = {
+        "ts": int(time.time()),
+        "event": event,
+        **kwargs,
+    }
+    try:
+        with open(WORKER_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
 
 def safe_filename(name: Optional[str]) -> str:
@@ -120,7 +133,7 @@ def is_global_network_available() -> bool:
 
 
 def requires_global_network(task_type: str) -> bool:
-    return task_type in {"direct_url", "ytdlp_url"}
+    return task_type in {"direct_url"}
 
 
 def requeue_task(task: dict) -> dict:
@@ -383,40 +396,6 @@ def split_file_parts(file_path: Path, part_size_mb: int) -> list[Path]:
     return parts
 
 
-def run_ytdlp(task: dict) -> Path:
-    url = task.get("url", "").strip()
-    mode = (task.get("mode") or "video").lower()
-    format_id = str(task.get("format_id") or "").strip()
-    audio_quality = str(task.get("audio_quality") or "320").strip()
-    if not url:
-        raise RuntimeError("URL خالی است")
-    push_status(task, "در حال دانلود با yt-dlp ...", "downloading")
-    out_tpl = str(unique_path(URL_DIR / f"yt_{int(time.time())}.%(ext)s"))
-    cmd = [
-        "yt-dlp",
-        "--no-playlist",
-        "-o",
-        out_tpl,
-    ]
-    if mode == "audio":
-        if audio_quality not in {"128", "192", "320"}:
-            audio_quality = "320"
-        cmd += ["-x", "--audio-format", "mp3", "--audio-quality", audio_quality]
-    else:
-        if format_id:
-            cmd += ["-f", f"{format_id}+ba/b"]
-        else:
-            cmd += ["-f", "bv*+ba/b"]
-    cmd += [url]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.strip() or "دانلود با yt-dlp ناموفق بود.")
-    produced = sorted(URL_DIR.glob("yt_*"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not produced:
-        raise RuntimeError("فایل خروجی yt-dlp پیدا نشد.")
-    return produced[0]
-
-
 def send_text_message(text: str, session_name: Optional[str] = None):
     client = RubikaClient(name=(session_name or SESSION))
     try:
@@ -453,12 +432,19 @@ def append_failed(task: dict, error: str) -> None:
         file.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 def process_task(task: dict):
+    task_started_at = time.time()
     task_type = task.get("type")
     caption = task.get("caption", "")
     safe_mode = task.get("safe_mode", False)
     zip_password = task.get("zip_password", "")
 
     session_name = task.get("rubika_session") or SESSION
+    worker_log(
+        "task_started",
+        job_id=task.get("job_id"),
+        task_type=task_type,
+        session=session_name,
+    )
     part_size_mb = int(task.get("part_size_mb") or DEFAULT_PART_SIZE_MB)
     if requires_global_network(task_type):
         if not is_global_network_available():
@@ -475,12 +461,24 @@ def process_task(task: dict):
             raise RuntimeError("Local file not found.")
 
     elif task_type == "direct_url":
+        worker_log("phase", job_id=task.get("job_id"), phase="download_url_started")
         local_path = download_url(task)
-    elif task_type == "ytdlp_url":
-        local_path = run_ytdlp(task)
+        worker_log(
+            "phase",
+            job_id=task.get("job_id"),
+            phase="download_url_done",
+            file_name=local_path.name if local_path else "",
+            file_size=local_path.stat().st_size if local_path and local_path.exists() else 0,
+        )
     elif task_type == "text_message":
         send_text_message(task.get("text", ""), session_name=session_name)
         push_status(task, "متن/لینک با موفقیت در روبیکا ارسال شد.", "done")
+        worker_log(
+            "task_done",
+            job_id=task.get("job_id"),
+            task_type=task_type,
+            duration_ms=int((time.time() - task_started_at) * 1000),
+        )
         return
     elif task_type == "bundle_local_files":
         files = [Path(p) for p in task.get("files", []) if Path(p).exists()]
@@ -488,13 +486,30 @@ def process_task(task: dict):
             raise RuntimeError("فایلی برای ساخت bundle پیدا نشد.")
         push_status(task, "در حال ساخت zip گروهی ...", "processing")
         zip_password = task.get("zip_password", "") if task.get("safe_mode") else ""
+        zip_started_at = time.time()
         bundle = make_bundle_zip(files, task.get("zip_name", "bundle"), zip_password)
+        worker_log(
+            "phase",
+            job_id=task.get("job_id"),
+            phase="bundle_zip_done",
+            zip_name=bundle.name,
+            zip_size=bundle.stat().st_size if bundle.exists() else 0,
+            duration_ms=int((time.time() - zip_started_at) * 1000),
+        )
         for src in files:
             try:
                 src.unlink()
             except Exception:
                 pass
+        split_started_at = time.time()
         parts = split_file_parts(bundle, part_size_mb)
+        worker_log(
+            "phase",
+            job_id=task.get("job_id"),
+            phase="split_done",
+            parts=len(parts),
+            duration_ms=int((time.time() - split_started_at) * 1000),
+        )
         try:
             for idx, part in enumerate(parts, start=1):
                 push_status(
@@ -502,8 +517,25 @@ def process_task(task: dict):
                     f"ارسال پارت {idx} از {len(parts)} به روبیکا ...",
                     "uploading",
                 )
+                part_started_at = time.time()
                 send_with_retry(str(part), caption="", task=task, session_name=session_name)
+                worker_log(
+                    "phase",
+                    job_id=task.get("job_id"),
+                    phase="upload_part_done",
+                    part_index=idx,
+                    part_name=part.name,
+                    part_size=part.stat().st_size if part.exists() else 0,
+                    duration_ms=int((time.time() - part_started_at) * 1000),
+                )
             push_status(task, "همه پارت‌ها با موفقیت در روبیکا ارسال شدند.", "done")
+            worker_log(
+                "task_done",
+                job_id=task.get("job_id"),
+                task_type=task_type,
+                parts=len(parts),
+                duration_ms=int((time.time() - task_started_at) * 1000),
+            )
         finally:
             for part in parts:
                 try:
@@ -529,7 +561,7 @@ def process_task(task: dict):
 
     if safe_mode and zip_password:
         push_status(task, "در حال تبدیل به فایل zip ...", "processing")
-
+        zip_started_at = time.time()
         try:
             zipped = make_zip_with_password(local_path, zip_password)
         finally:
@@ -540,23 +572,56 @@ def process_task(task: dict):
                 pass
 
         send_path = zipped
+        worker_log(
+            "phase",
+            job_id=task.get("job_id"),
+            phase="safe_zip_done",
+            zip_name=send_path.name if send_path else "",
+            zip_size=send_path.stat().st_size if send_path and send_path.exists() else 0,
+            duration_ms=int((time.time() - zip_started_at) * 1000),
+        )
 
     else:
         send_path = local_path
 
+    split_started_at = time.time()
     send_parts = split_file_parts(send_path, part_size_mb)
+    worker_log(
+        "phase",
+        job_id=task.get("job_id"),
+        phase="split_done",
+        parts=len(send_parts),
+        duration_ms=int((time.time() - split_started_at) * 1000),
+    )
 
     try:
         if is_cancelled(task):
             raise RuntimeError("ارسال لغو شد.")
         for idx, part in enumerate(send_parts, start=1):
             part_caption = caption if idx == 1 else f"{caption}\npart {idx}/{len(send_parts)}"
+            part_started_at = time.time()
             send_with_retry(str(part), part_caption, task, session_name=session_name)
+            worker_log(
+                "phase",
+                job_id=task.get("job_id"),
+                phase="upload_part_done",
+                part_index=idx,
+                part_name=part.name,
+                part_size=part.stat().st_size if part.exists() else 0,
+                duration_ms=int((time.time() - part_started_at) * 1000),
+            )
 
         push_status(
             task,
             "فایل با موفقیت در روبیکا آپلود شد.",
             "done"
+        )
+        worker_log(
+            "task_done",
+            job_id=task.get("job_id"),
+            task_type=task_type,
+            parts=len(send_parts),
+            duration_ms=int((time.time() - task_started_at) * 1000),
         )
 
     finally:
@@ -587,8 +652,20 @@ def worker_loop():
             process_task(task)
         except Exception as e:
             err = str(e)
+            worker_log(
+                "task_failed",
+                job_id=task.get("job_id"),
+                task_type=task.get("type"),
+                error=err,
+            )
             if "global_internet_unreachable" in err or "اینترنت بین‌الملل در دسترس نیست" in err:
                 new_task = requeue_task(task)
+                worker_log(
+                    "task_requeued",
+                    job_id=task.get("job_id"),
+                    new_job_id=new_task.get("job_id"),
+                    reason="global_network_unreachable",
+                )
                 push_status(
                     task,
                     "اینترنت بین‌الملل قطع است. کار حذف نشد و دوباره در صف قرار گرفت.",
