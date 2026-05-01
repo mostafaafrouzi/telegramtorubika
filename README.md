@@ -108,7 +108,12 @@ python main.py
 - Uninstall
 - Backup
 - Restore
-- Service logs
+- Service logs (live)
+- Installer logs
+- Installer JSON logs
+- Bot logs
+- Worker logs
+- Export + show all logs (copy-friendly bundle)
 
 ## Troubleshooting
 
@@ -161,6 +166,11 @@ python main.py
   sudo bash installer.sh --backup
   sudo bash installer.sh --restore
   sudo bash installer.sh --logs
+  sudo bash installer.sh --installer-logs
+  sudo bash installer.sh --installer-json-logs
+  sudo bash installer.sh --bot-logs
+  sudo bash installer.sh --worker-logs
+  sudo bash installer.sh --all-logs
   ```
 
 ### Log interpretation checklist

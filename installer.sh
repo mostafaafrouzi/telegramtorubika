@@ -231,6 +231,12 @@ update_build_version_in_env(){
   fi
 }
 
+read_app_version(){
+  local env_file="${1:-}"
+  [[ -n "$env_file" && -f "$env_file" ]] || { echo "unknown"; return; }
+  grep '^APP_BUILD_VERSION=' "$env_file" 2>/dev/null | head -n1 | sed 's/^APP_BUILD_VERSION=//' || echo "unknown"
+}
+
 notify_admin(){
   local bot_token="$1" admin_ids_csv="$2" text="$3"
   IFS=',' read -r -a ids <<< "$admin_ids_csv"
@@ -305,7 +311,9 @@ install_flow(){
   write_env "$dir" "$api_id" "$api_hash" "$bot_token" "$rub_sess" "$admin_ids" "$part_size" || return 1
   create_service "$svc" "$dir" "$user" || return 1
   post_deploy_health_check "$svc" "$dir" || return 1
-  notify_admin "$bot_token" "$admin_ids" "telegramtorubika install successful on $(hostname)"
+  local ver
+  ver="$(read_app_version "$dir/.env")"
+  notify_admin "$bot_token" "$admin_ids" "telegramtorubika install successful on $(hostname) version=${ver}"
   ok "Install completed."
 }
 
@@ -332,7 +340,9 @@ update_flow(){
   if [[ -f "$dir/.env" ]]; then
     bot_token="$(grep '^BOT_TOKEN=' "$dir/.env" | sed 's/^BOT_TOKEN=//' || true)"
     admin_ids="$(grep '^ADMIN_IDS=' "$dir/.env" | sed 's/^ADMIN_IDS=//' || true)"
-    [[ -n "$bot_token" && -n "$admin_ids" ]] && notify_admin "$bot_token" "$admin_ids" "telegramtorubika update successful on $(hostname)"
+    local ver
+    ver="$(read_app_version "$dir/.env")"
+    [[ -n "$bot_token" && -n "$admin_ids" ]] && notify_admin "$bot_token" "$admin_ids" "telegramtorubika update successful on $(hostname) version=${ver}"
   fi
   ok "Update completed."
 }
@@ -409,6 +419,85 @@ logs_flow(){
   journalctl -u "$svc" -f -n 120
 }
 
+installer_logs_flow(){
+  info "Showing installer text logs: $LOG_FILE"
+  tail -n 300 "$LOG_FILE" || true
+}
+
+installer_json_logs_flow(){
+  info "Showing installer JSON logs: $LOG_JSON_FILE"
+  tail -n 300 "$LOG_JSON_FILE" || true
+}
+
+bot_logs_flow(){
+  local dir
+  if select_instance; then
+    dir="$SELECTED_DIR"
+    info "Selected instance for bot logs: $SELECTED_NAME ($dir)"
+  else
+    dir="$(ask "Install directory" "$DEFAULT_INSTALL_DIR")"
+  fi
+  info "Showing bot logs: $dir/queue/bot_events.jsonl"
+  tail -n 300 "$dir/queue/bot_events.jsonl" || true
+}
+
+worker_logs_flow(){
+  local dir
+  if select_instance; then
+    dir="$SELECTED_DIR"
+    info "Selected instance for worker logs: $SELECTED_NAME ($dir)"
+  else
+    dir="$(ask "Install directory" "$DEFAULT_INSTALL_DIR")"
+  fi
+  info "Showing worker logs: $dir/queue/worker_events.jsonl"
+  tail -n 300 "$dir/queue/worker_events.jsonl" || true
+}
+
+all_logs_flow(){
+  local svc dir out
+  if select_instance; then
+    svc="$SELECTED_NAME"
+    dir="$SELECTED_DIR"
+    info "Selected instance for all logs: $svc ($dir)"
+  else
+    dir="$(ask "Install directory" "$DEFAULT_INSTALL_DIR")"
+    svc="$(ask "Systemd service name" "$DEFAULT_SERVICE_NAME")"
+  fi
+
+  out="/tmp/tele2rub-all-logs-$(date +%Y%m%d-%H%M%S).txt"
+  {
+    echo "===== TELE2RUB ALL LOGS ====="
+    echo "generated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "service=$svc"
+    echo "install_dir=$dir"
+    echo
+
+    echo "===== INSTALLER LOG (tail -n 300) ====="
+    tail -n 300 "$LOG_FILE" 2>/dev/null || echo "(missing) $LOG_FILE"
+    echo
+
+    echo "===== INSTALLER JSON LOG (tail -n 300) ====="
+    tail -n 300 "$LOG_JSON_FILE" 2>/dev/null || echo "(missing) $LOG_JSON_FILE"
+    echo
+
+    echo "===== SERVICE JOURNAL (tail -n 300) ====="
+    journalctl -u "$svc" -n 300 --no-pager 2>/dev/null || echo "(journal unavailable for $svc)"
+    echo
+
+    echo "===== BOT EVENTS (tail -n 300) ====="
+    tail -n 300 "$dir/queue/bot_events.jsonl" 2>/dev/null || echo "(missing) $dir/queue/bot_events.jsonl"
+    echo
+
+    echo "===== WORKER EVENTS (tail -n 300) ====="
+    tail -n 300 "$dir/queue/worker_events.jsonl" 2>/dev/null || echo "(missing) $dir/queue/worker_events.jsonl"
+    echo
+  } > "$out"
+
+  ok "All logs exported: $out"
+  echo
+  cat "$out"
+}
+
 menu(){
   while true; do
     clear
@@ -421,9 +510,14 @@ menu(){
     echo "4) Backup"
     echo "5) Restore"
     echo "6) Show Service Logs"
-    echo "7) Exit"
+    echo "7) Show Installer Logs"
+    echo "8) Show Installer JSON Logs"
+    echo "9) Show Bot Logs"
+    echo "10) Show Worker Logs"
+    echo "11) Export + Show All Logs (copy-friendly)"
+    echo "12) Exit"
     echo
-    read -r -p "Choose [1-7]: " c
+    read -r -p "Choose [1-12]: " c
     case "$c" in
       1) install_flow || err "Install failed"; pause ;;
       2) update_flow || err "Update failed"; pause ;;
@@ -431,7 +525,12 @@ menu(){
       4) backup_flow || err "Backup failed"; pause ;;
       5) restore_flow || err "Restore failed"; pause ;;
       6) logs_flow || true; pause ;;
-      7) exit 0 ;;
+      7) installer_logs_flow || true; pause ;;
+      8) installer_json_logs_flow || true; pause ;;
+      9) bot_logs_flow || true; pause ;;
+      10) worker_logs_flow || true; pause ;;
+      11) all_logs_flow || true; pause ;;
+      12) exit 0 ;;
       *) warn "Invalid choice"; pause ;;
     esac
   done
@@ -446,10 +545,15 @@ run_quick_flag(){
     --backup) backup_flow; exit $? ;;
     --restore) restore_flow; exit $? ;;
     --logs) logs_flow; exit $? ;;
+    --installer-logs) installer_logs_flow; exit $? ;;
+    --installer-json-logs) installer_json_logs_flow; exit $? ;;
+    --bot-logs) bot_logs_flow; exit $? ;;
+    --worker-logs) worker_logs_flow; exit $? ;;
+    --all-logs) all_logs_flow; exit $? ;;
     "") return 0 ;;
     *)
       err "Unknown flag: $flag"
-      echo "Usage: bash installer.sh [--install|--update|--uninstall|--backup|--restore|--logs]"
+      echo "Usage: bash installer.sh [--install|--update|--uninstall|--backup|--restore|--logs|--installer-logs|--installer-json-logs|--bot-logs|--worker-logs|--all-logs]"
       exit 1
       ;;
   esac

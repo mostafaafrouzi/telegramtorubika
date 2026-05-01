@@ -437,9 +437,13 @@ def process_task(task: dict):
     caption = task.get("caption", "")
     safe_mode = task.get("safe_mode", False)
     zip_password = task.get("zip_password", "")
+    chat_id = task.get("chat_id")
+
+    def wl(event: str, **extra):
+        worker_log(event, chat_id=chat_id, **extra)
 
     session_name = task.get("rubika_session") or SESSION
-    worker_log(
+    wl(
         "task_started",
         job_id=task.get("job_id"),
         task_type=task_type,
@@ -461,9 +465,9 @@ def process_task(task: dict):
             raise RuntimeError("Local file not found.")
 
     elif task_type == "direct_url":
-        worker_log("phase", job_id=task.get("job_id"), phase="download_url_started")
+        wl("phase", job_id=task.get("job_id"), phase="download_url_started")
         local_path = download_url(task)
-        worker_log(
+        wl(
             "phase",
             job_id=task.get("job_id"),
             phase="download_url_done",
@@ -473,7 +477,7 @@ def process_task(task: dict):
     elif task_type == "text_message":
         send_text_message(task.get("text", ""), session_name=session_name)
         push_status(task, "متن/لینک با موفقیت در روبیکا ارسال شد.", "done")
-        worker_log(
+        wl(
             "task_done",
             job_id=task.get("job_id"),
             task_type=task_type,
@@ -488,7 +492,7 @@ def process_task(task: dict):
         zip_password = task.get("zip_password", "") if task.get("safe_mode") else ""
         zip_started_at = time.time()
         bundle = make_bundle_zip(files, task.get("zip_name", "bundle"), zip_password)
-        worker_log(
+        wl(
             "phase",
             job_id=task.get("job_id"),
             phase="bundle_zip_done",
@@ -503,7 +507,7 @@ def process_task(task: dict):
                 pass
         split_started_at = time.time()
         parts = split_file_parts(bundle, part_size_mb)
-        worker_log(
+        wl(
             "phase",
             job_id=task.get("job_id"),
             phase="split_done",
@@ -519,7 +523,7 @@ def process_task(task: dict):
                 )
                 part_started_at = time.time()
                 send_with_retry(str(part), caption="", task=task, session_name=session_name)
-                worker_log(
+                wl(
                     "phase",
                     job_id=task.get("job_id"),
                     phase="upload_part_done",
@@ -529,7 +533,7 @@ def process_task(task: dict):
                     duration_ms=int((time.time() - part_started_at) * 1000),
                 )
             push_status(task, "همه پارت‌ها با موفقیت در روبیکا ارسال شدند.", "done")
-            worker_log(
+            wl(
                 "task_done",
                 job_id=task.get("job_id"),
                 task_type=task_type,
@@ -572,7 +576,7 @@ def process_task(task: dict):
                 pass
 
         send_path = zipped
-        worker_log(
+        wl(
             "phase",
             job_id=task.get("job_id"),
             phase="safe_zip_done",
@@ -586,7 +590,7 @@ def process_task(task: dict):
 
     split_started_at = time.time()
     send_parts = split_file_parts(send_path, part_size_mb)
-    worker_log(
+    wl(
         "phase",
         job_id=task.get("job_id"),
         phase="split_done",
@@ -601,7 +605,7 @@ def process_task(task: dict):
             part_caption = caption if idx == 1 else f"{caption}\npart {idx}/{len(send_parts)}"
             part_started_at = time.time()
             send_with_retry(str(part), part_caption, task, session_name=session_name)
-            worker_log(
+            wl(
                 "phase",
                 job_id=task.get("job_id"),
                 phase="upload_part_done",
@@ -616,7 +620,7 @@ def process_task(task: dict):
             "فایل با موفقیت در روبیکا آپلود شد.",
             "done"
         )
-        worker_log(
+        wl(
             "task_done",
             job_id=task.get("job_id"),
             task_type=task_type,
@@ -654,6 +658,7 @@ def worker_loop():
             err = str(e)
             worker_log(
                 "task_failed",
+                chat_id=task.get("chat_id"),
                 job_id=task.get("job_id"),
                 task_type=task.get("type"),
                 error=err,
@@ -662,6 +667,7 @@ def worker_loop():
                 new_task = requeue_task(task)
                 worker_log(
                     "task_requeued",
+                    chat_id=task.get("chat_id"),
                     job_id=task.get("job_id"),
                     new_job_id=new_task.get("job_id"),
                     reason="global_network_unreachable",
