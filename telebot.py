@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 from pyrogram import Client, filters, idle
 from pyrogram.enums import ParseMode
+from pyrogram.errors import MessageNotModified
 from pyrogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -44,6 +45,12 @@ FAILED_FILE = QUEUE_DIR / "failed.jsonl"
 BOT_LOG_FILE = QUEUE_DIR / "bot_events.jsonl"
 WORKER_EVENTS_FILE = QUEUE_DIR / "worker_events.jsonl"
 KNOWN_CHATS_FILE = QUEUE_DIR / "known_chats.json"
+BROADCAST_STATE_FILE = QUEUE_DIR / "broadcast_state.json"
+DISABLE_UPDATE_BROADCAST = os.getenv("DISABLE_UPDATE_BROADCAST", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 ADMIN_IDS = {
     int(x.strip())
@@ -105,8 +112,7 @@ I18N = {
         "btn_rub_status": "وضعیت روبیکا",
         "btn_zip_start": "شروع فایل ZIP",
         "btn_zip_end": "پایان فایل ZIP",
-        "btn_send_link": "ارسال لینک",
-        "btn_send_text": "ارسال متن",
+        "btn_send_content": "ارسال متن یا لینک",
         "btn_queue": "مدیریت صف",
         "btn_clear_all": "حذف همه",
         "btn_direct_on": "حالت مستقیم روشن",
@@ -119,7 +125,7 @@ I18N = {
         "btn_inline_recent": "آخرین کارها",
         "queue_kb_refresh": "بروزرسانی شد",
         "queue_kb_cleared": "صف پاک شد",
-        "directmode_usage": "Use: /directmode on یا /directmode off",
+        "directmode_usage": "استفاده: `/directmode on` یا `/directmode off`",
         "direct_on": "حالت مستقیم فعال شد.",
         "direct_off": "حالت مستقیم غیرفعال شد.",
         "newbatch_ok": (
@@ -136,6 +142,166 @@ I18N = {
             "- لغوشده‌ها: `{cancelled}`\n\n"
             "برای پاکسازی صف از دکمهٔ «پاکسازی صف من» استفاده کن."
         ),
+        "help_short": (
+            "راهنمای سریع:\n\n"
+            "منوی اتصال:\n"
+            "- اتصال روبیکا: `/rubika_connect`\n"
+            "- وضعیت روبیکا: `/rubika_status`\n\n"
+            "منوی فایل‌ها:\n"
+            "- شروع فایل ZIP: `/newbatch`\n"
+            "- پایان فایل ZIP: `/done`\n"
+            "- متن یا لینک به روبیکا: دکمهٔ «ارسال متن یا لینک» یا `/sendtext` / `/sendlink`\n"
+            "- پاکسازی صف: `/delall`\n\n"
+            "منوی تنظیمات:\n"
+            "- حالت مستقیم: `/directmode on|off`\n"
+            "- safe mode: `/safemode on|off`\n\n"
+            "عیب‌یابی:\n"
+            "- وضعیت شبکه: `/netstatus`\n"
+            "- پنل ادمین: `/admin`\n"
+            "- حذف یک job: `/del <job_id>`\n\n"
+            "برای راهنمای تحلیل لاگ: `/loghelp`"
+        ),
+        "loghelp_body": (
+            "راهنمای تحلیل لاگ job:\n\n"
+            "1) ابتدا `job_id` را از پیام Queued بردار.\n"
+            "2) در bot logs دنبال `task_queued` با همان `job_id` بگرد.\n"
+            "3) در worker logs باید به‌ترتیب ببینی:\n"
+            "   `task_started` -> (`task_done` یا `task_failed`).\n"
+            "4) اگر `task_requeued` دیدی، مشکل شبکه/دسترسی بوده و job جدید ساخته شده.\n"
+            "5) برای اتصال روبیکا، eventهای `rubika_connect_ok` یا `rubika_connect_failed` را چک کن.\n\n"
+            "مسیر لاگ‌ها:\n"
+            "- `/opt/tele2rub/queue/bot_events.jsonl`\n"
+            "- `/opt/tele2rub/queue/worker_events.jsonl`\n"
+            "- `/tmp/tele2rub-installer.jsonl`"
+        ),
+        "rubika_not_connected": "روبیکا متصل نیست. از `/rubika_connect` استفاده کن.",
+        "rubika_checking": "در حال بررسی وضعیت واقعی اتصال روبیکا ...",
+        "rubika_ok": (
+            "اتصال روبیکا فعال و معتبر است ✅\n"
+            "session: `{session}`\n"
+            "جزئیات: `{details}`"
+        ),
+        "rubika_invalid_session": (
+            "اتصال ذخیره‌شده معتبر نیست ❌\n"
+            "session: `{session}`\n"
+            "خطا: `{details}`\n\n"
+            "لطفاً دوباره از دکمه «اتصال روبیکا» استفاده کن."
+        ),
+        "rubika_already_connected": (
+            "اکانت روبیکا از قبل متصل است.\n"
+            "session: `{session}`\n\n"
+            "برای اتصال مجدد، شماره جدید را ارسال کن."
+        ),
+        "rubika_ask_phone": (
+            "شماره روبیکا را با پیش‌شماره کشور ارسال کن.\n"
+            "مثال: `98912xxxxxxx`"
+        ),
+        "rubika_passkey_needed": "این شماره نیاز به PassKey دارد. PassKey روبیکا را ارسال کن.",
+        "rubika_code_sent": "کد ارسال شد. کد تایید روبیکا را بفرست.",
+        "rubika_send_code_error": "خطا در ارسال کد روبیکا: {error}",
+        "rubika_connected_ok": "روبیکا با موفقیت متصل شد ✅",
+        "rubika_bad_code": "کد تایید نامعتبر یا خطای ورود: {error}",
+        "version_line": "telegramtorubika `{version}`",
+        "update_notice": (
+            "ربات به‌روز شد ✅\n"
+            "نسخه: `{version}`\n"
+            "`/menu` منوی اصلی · `/lang` زبان"
+        ),
+        "prompt_quick_message": (
+            "پیام بعدی‌ات را بفرست (متن خالی، فقط لینک، یا متن همراه لینک).\n"
+            "بدون تأیید اضافه در صف روبیکا قرار می‌گیرد."
+        ),
+        "empty_message": "پیام خالی است.",
+        "text_queueing": "در حال قرار دادن در صف ...",
+        "text_queued": (
+            "در صف قرار گرفت ✅\n"
+            "Job: `{job_id}`\n"
+            "جایگاه تقریبی در صف شما: `{qpos}`\n\n"
+            "برای جزئیات «مدیریت صف» را بزن."
+        ),
+        "sendtext_usage": "فرمت: `/sendtext متن`",
+        "sendlink_usage": "فرمت: `/sendlink <url>`",
+        "invalid_link": "در این متن لینک http(s) معتبر پیدا نشد.",
+        "safemode_usage": "از `/safemode on` یا `/safemode off` استفاده کن.",
+        "safemode_on": (
+            "Safe Mode فعال شد.\n\n"
+            "رمزی که می‌خواهی روی ZIP باشد را بفرست.\n"
+            "از این به بعد فایل‌ها قبل از روبیکا با این رمز ZIP می‌شوند."
+        ),
+        "safemode_off": "Safe Mode غیرفعال شد.\n\nاز این به بعد فایل‌ها به‌صورت عادی ارسال می‌شوند.",
+        "safemode_bad": "دستور نامعتبر. `/safemode on` یا `/safemode off`",
+        "queue_empty": "صف خالی است.",
+        "queue_cleared_all": "تمام موارد در صف پاک شد.",
+        "removed_from_queue": "این مورد از صف حذف شد.",
+        "done_no_batch": "جلسه فایل ZIP فعالی پیدا نشد یا فایل ندارد.",
+        "zip_name_prompt": "نام فایل ZIP را ارسال کن (بدون پسوند).",
+        "part_mb_prompt": "سایز هر پارت (MB) را بفرست. مثال: 1900",
+        "part_mb_invalid": "عدد معتبر بفرست. مثال: 1900",
+        "part_mb_min": "حداقل سایز پارت 50MB است.",
+        "zip_no_files": "فایلی برای ساخت ZIP پیدا نشد.",
+        "zip_large_warn": (
+            "⚠️ حجم فایل ZIP بزرگ است. تلگرام ممکن است ارسال فایل را رد کند؛ "
+            "فایل روی سرور آماده است و می‌تواند به روبیکا ارسال شود."
+        ),
+        "zip_ready_caption": (
+            "فایل ZIP آماده شد ✅\n"
+            "تعداد فایل‌ها: `{n}`\n"
+            "حجم کل ورودی: `{insize}`\n"
+            "حجم ZIP: `{zsize}`"
+        ),
+        "zip_ready_no_doc": (
+            "فایل ZIP آماده شد ✅\n"
+            "تعداد فایل‌ها: `{n}`\n"
+            "حجم کل ورودی: `{insize}`\n"
+            "حجم ZIP: `{zsize}`\n"
+            "(ارسال فایل در تلگرام ناموفق؛ روی سرور آماده است)"
+        ),
+        "zip_queue_summary": "ZIP آماده شد: `{name}`\nآیا به روبیکا ارسال شود؟",
+        "password_empty": "رمز نمی‌تواند خالی باشد.",
+        "password_saved_zip": (
+            "رمز ذخیره شد.\n\n"
+            "از این به بعد فایل‌ها قبل از روبیکا به‌صورت ZIP رمزدار آماده می‌شوند."
+        ),
+        "net_status": (
+            "وضعیت شبکه: `{mode}`\n"
+            "دلیل: `{reason}`\n"
+            "آخرین بروزرسانی: `{updated}`"
+        ),
+        "admin_panel": (
+            "پنل ادمین:\n\n"
+            "Queue total: `{qt}`\n"
+            "Cancelled jobs: `{cancelled}`\n"
+            "Deleted jobs: `{deleted}`\n"
+            "Failed jobs: `{failed}`\n"
+            "Network mode: `{net_mode}`\n"
+            "Reason: `{net_reason}`"
+        ),
+        "eta_unknown": "نامشخص",
+        "download_progress_line": (
+            "📥 در حال دریافت از تلگرام\n\n"
+            "فایل: `{file_name}`\n"
+            "حجم: `{total}`\n"
+            "پیشرفت: `{percent:.1f}%`\n"
+            "`{bar}`\n"
+            "سرعت: `{speed}/s`\n"
+            "زمان باقی‌مانده: `{eta}`"
+        ),
+        "media_need_rubika": "ابتدا روبیکا را متصل کن: `/rubika_connect`",
+        "media_bad_type": "فایل قابل پردازش نیست.",
+        "media_download_status": "فایل دریافت شد.\n\nوضعیت: آماده‌سازی برای دانلود از تلگرام...",
+        "media_zip_added": (
+            "✅ فایل به جلسه ZIP اضافه شد.\n"
+            "تعداد فایل‌های فعلی: `{n}`\n\n"
+            "فایل بیشتر بفرست یا «پایان فایل ZIP» را بزن."
+        ),
+        "media_file_ready": (
+            "فایل آماده است: `{name}` ({size})\n"
+            "در انتظار تأیید ارسال به روبیکا..."
+        ),
+        "media_error": "خطا: {error}",
+        "file_prepared_summary": "فایل آماده شد: `{name}`",
+        "queued_processing": "Queued for processing...",
+        "confirm_send_suffix": "به روبیکا همین حالا ارسال شود؟",
     },
     "en": {
         "welcome": (
@@ -176,8 +342,7 @@ I18N = {
         "btn_rub_status": "Rubika status",
         "btn_zip_start": "Start ZIP",
         "btn_zip_end": "End ZIP",
-        "btn_send_link": "Send link",
-        "btn_send_text": "Send text",
+        "btn_send_content": "Send text or link",
         "btn_queue": "Queue",
         "btn_clear_all": "Clear all",
         "btn_direct_on": "Direct mode on",
@@ -207,6 +372,166 @@ I18N = {
             "- Cancelled: `{cancelled}`\n\n"
             "Use «Clear my queue» to wipe your pending tasks."
         ),
+        "help_short": (
+            "Quick help:\n\n"
+            "Connection:\n"
+            "- Connect Rubika: `/rubika_connect`\n"
+            "- Rubika status: `/rubika_status`\n\n"
+            "Files:\n"
+            "- Start ZIP batch: `/newbatch`\n"
+            "- Finish ZIP: `/done`\n"
+            "- Text/link to Rubika: «Send text or link» or `/sendtext` / `/sendlink`\n"
+            "- Clear queue: `/delall`\n\n"
+            "Settings:\n"
+            "- Direct mode: `/directmode on|off`\n"
+            "- Safe mode: `/safemode on|off`\n\n"
+            "Troubleshooting:\n"
+            "- Network: `/netstatus`\n"
+            "- Admin: `/admin`\n"
+            "- Remove one job: `/del <job_id>`\n\n"
+            "Log analysis: `/loghelp`"
+        ),
+        "loghelp_body": (
+            "Job log analysis:\n\n"
+            "1) Copy `job_id` from the Queued message.\n"
+            "2) In bot logs, find `task_queued` with that `job_id`.\n"
+            "3) In worker logs you should see:\n"
+            "   `task_started` -> (`task_done` or `task_failed`).\n"
+            "4) If you see `task_requeued`, network/access failed and a new job was created.\n"
+            "5) For Rubika login, check `rubika_connect_ok` / `rubika_connect_failed`.\n\n"
+            "Log paths:\n"
+            "- `/opt/tele2rub/queue/bot_events.jsonl`\n"
+            "- `/opt/tele2rub/queue/worker_events.jsonl`\n"
+            "- `/tmp/tele2rub-installer.jsonl`"
+        ),
+        "rubika_not_connected": "Rubika is not linked. Use `/rubika_connect`.",
+        "rubika_checking": "Checking live Rubika session...",
+        "rubika_ok": (
+            "Rubika session is valid ✅\n"
+            "session: `{session}`\n"
+            "details: `{details}`"
+        ),
+        "rubika_invalid_session": (
+            "Saved session is not valid ❌\n"
+            "session: `{session}`\n"
+            "error: `{details}`\n\n"
+            "Use «Connect Rubika» again."
+        ),
+        "rubika_already_connected": (
+            "Rubika is already linked.\n"
+            "session: `{session}`\n\n"
+            "To reconnect, send a new phone number."
+        ),
+        "rubika_ask_phone": (
+            "Send your Rubika phone with country code.\n"
+            "Example: `98912xxxxxxx`"
+        ),
+        "rubika_passkey_needed": "This number needs a PassKey. Send your Rubika PassKey.",
+        "rubika_code_sent": "Code sent. Send the Rubika verification code.",
+        "rubika_send_code_error": "Error sending Rubika code: {error}",
+        "rubika_connected_ok": "Rubika linked successfully ✅",
+        "rubika_bad_code": "Invalid code or sign-in error: {error}",
+        "version_line": "telegramtorubika `{version}`",
+        "update_notice": (
+            "Bot updated ✅\n"
+            "Version: `{version}`\n"
+            "`/menu` main menu · `/lang` language"
+        ),
+        "prompt_quick_message": (
+            "Send your next message (plain text, a link, or both).\n"
+            "It is queued for Rubika without an extra confirmation step."
+        ),
+        "empty_message": "Message is empty.",
+        "text_queueing": "Queueing...",
+        "text_queued": (
+            "Queued ✅\n"
+            "Job: `{job_id}`\n"
+            "Approx. position in your queue: `{qpos}`\n\n"
+            "Use «Queue» for details."
+        ),
+        "sendtext_usage": "Format: `/sendtext ...`",
+        "sendlink_usage": "Format: `/sendlink <url>`",
+        "invalid_link": "No valid http(s) link found in that text.",
+        "safemode_usage": "Use `/safemode on` or `/safemode off`.",
+        "safemode_on": (
+            "Safe Mode enabled.\n\n"
+            "Send the password you want on ZIP files.\n"
+            "Files will be ZIP-encrypted before Rubika."
+        ),
+        "safemode_off": "Safe Mode disabled.\n\nFiles will upload normally.",
+        "safemode_bad": "Invalid command. Use `/safemode on` or `/safemode off`.",
+        "queue_empty": "Your queue is empty.",
+        "queue_cleared_all": "All your queued tasks were removed.",
+        "removed_from_queue": "Removed from queue.",
+        "done_no_batch": "No active ZIP batch or no files collected.",
+        "zip_name_prompt": "Send the ZIP base name (no extension).",
+        "part_mb_prompt": "Part size in MB, e.g. `1900`",
+        "part_mb_invalid": "Send a valid number, e.g. `1900`",
+        "part_mb_min": "Minimum part size is 50 MB.",
+        "zip_no_files": "No files left to build the ZIP.",
+        "zip_large_warn": (
+            "⚠️ ZIP is large; Telegram may refuse sending the file. "
+            "It is still on the server and can go to Rubika."
+        ),
+        "zip_ready_caption": (
+            "ZIP ready ✅\n"
+            "Files: `{n}`\n"
+            "Input size: `{insize}`\n"
+            "ZIP size: `{zsize}`"
+        ),
+        "zip_ready_no_doc": (
+            "ZIP ready ✅\n"
+            "Files: `{n}`\n"
+            "Input size: `{insize}`\n"
+            "ZIP size: `{zsize}`\n"
+            "(Telegram upload failed; file is on the server)"
+        ),
+        "zip_queue_summary": "ZIP ready: `{name}`\nSend to Rubika?",
+        "password_empty": "Password cannot be empty.",
+        "password_saved_zip": (
+            "Password saved.\n\n"
+            "Files will be prepared as passworded ZIP before Rubika."
+        ),
+        "net_status": (
+            "Network: `{mode}`\n"
+            "Reason: `{reason}`\n"
+            "Updated: `{updated}`"
+        ),
+        "admin_panel": (
+            "Admin panel:\n\n"
+            "Queue total: `{qt}`\n"
+            "Cancelled jobs: `{cancelled}`\n"
+            "Deleted jobs: `{deleted}`\n"
+            "Failed jobs: `{failed}`\n"
+            "Network mode: `{net_mode}`\n"
+            "Reason: `{net_reason}`"
+        ),
+        "eta_unknown": "unknown",
+        "download_progress_line": (
+            "📥 Downloading from Telegram\n\n"
+            "File: `{file_name}`\n"
+            "Size: `{total}`\n"
+            "Progress: `{percent:.1f}%`\n"
+            "`{bar}`\n"
+            "Speed: `{speed}/s`\n"
+            "ETA: `{eta}`"
+        ),
+        "media_need_rubika": "Link Rubika first: `/rubika_connect`",
+        "media_bad_type": "Unsupported media type.",
+        "media_download_status": "Received.\n\nPreparing download from Telegram...",
+        "media_zip_added": (
+            "✅ Added to ZIP batch.\n"
+            "Files in batch: `{n}`\n\n"
+            "Send more or tap «End ZIP»."
+        ),
+        "media_file_ready": (
+            "File ready: `{name}` ({size})\n"
+            "Waiting for confirmation to send to Rubika..."
+        ),
+        "media_error": "Error: {error}",
+        "file_prepared_summary": "File prepared: `{name}`",
+        "queued_processing": "Queued for processing...",
+        "confirm_send_suffix": "Send to Rubika now?",
     },
 }
 
@@ -333,10 +658,7 @@ def build_files_menu(user_id: int) -> ReplyKeyboardMarkup:
                 KeyboardButton(tr(user_id, "btn_zip_start")),
                 KeyboardButton(tr(user_id, "btn_zip_end")),
             ],
-            [
-                KeyboardButton(tr(user_id, "btn_send_link")),
-                KeyboardButton(tr(user_id, "btn_send_text")),
-            ],
+            [KeyboardButton(tr(user_id, "btn_send_content"))],
             [
                 KeyboardButton(tr(user_id, "btn_queue")),
                 KeyboardButton(tr(user_id, "btn_clear_all")),
@@ -778,9 +1100,9 @@ def pretty_size(size) -> str:
     return f"{size:.2f} {units[index]}"
 
 
-def eta_text(seconds) -> str:
+def eta_text(seconds, user_id: int = 0) -> str:
     if not seconds or seconds <= 0:
-        return "نامشخص"
+        return tr(user_id, "eta_unknown") if user_id else "نامشخص"
 
     seconds = int(seconds)
     h = seconds // 3600
@@ -806,19 +1128,23 @@ async def download_progress(current, total, status_message, file_name, started_a
     elapsed = max(now - started_at, 1)
     speed = current / elapsed
     eta = (total - current) / speed if speed else None
+    uid = int(state.get("user_id") or 0)
 
-    text = (
-        f"📥 در حال دریافت فایل از تلگرام\n\n"
-        f"فایل: `{file_name}`\n"
-        f"حجم: `{pretty_size(total)}`\n"
-        f"پیشرفت: `{percent:.1f}%`\n"
-        f"`{progress_bar(percent)}`\n"
-        f"سرعت: `{pretty_size(speed)}/s`\n"
-        f"زمان باقی‌مانده: `{eta_text(eta)}`"
+    text = tr(
+        uid,
+        "download_progress_line",
+        file_name=file_name,
+        total=pretty_size(total),
+        percent=percent,
+        bar=progress_bar(percent),
+        speed=pretty_size(speed),
+        eta=eta_text(eta, uid),
     )
 
     try:
-        await status_message.edit_text(text)
+        await status_message.edit_text(text, parse_mode=None)
+    except MessageNotModified:
+        pass
     except Exception:
         pass
 
@@ -851,6 +1177,33 @@ async def status_watcher():
                     pass
         except Exception:
             pass
+
+
+async def maybe_broadcast_update():
+    """Notify known private chats once per APP_VERSION (disable with DISABLE_UPDATE_BROADCAST=1)."""
+    await asyncio.sleep(2)
+    if DISABLE_UPDATE_BROADCAST:
+        return
+    state = load_json(BROADCAST_STATE_FILE, {})
+    if state.get("last_broadcast_version") == APP_VERSION:
+        return
+    data = load_json(KNOWN_CHATS_FILE, {"ids": []})
+    ids = list(dict.fromkeys(data.get("ids", [])))
+    for cid in ids:
+        try:
+            uid = int(cid)
+            await app.send_message(
+                uid,
+                tr(uid, "update_notice", version=APP_VERSION),
+                reply_markup=build_main_menu(uid),
+            )
+        except Exception:
+            log_event("update_broadcast_skip", chat_id=cid)
+        await asyncio.sleep(0.06)
+    state["last_broadcast_version"] = APP_VERSION
+    save_json(BROADCAST_STATE_FILE, state)
+    log_event("update_broadcast_done", version=APP_VERSION, chats=len(ids))
+
 
 @app.on_message(filters.private & filters.command("start"))
 async def start_handler(client: Client, message: Message):
@@ -887,70 +1240,36 @@ async def lang_handler(client: Client, message: Message):
 
 @app.on_message(filters.private & filters.command("help"))
 async def help_handler(client: Client, message: Message):
-    await message.reply_text(
-        "راهنمای سریع:\n\n"
-        "منوی اتصال:\n"
-        "- اتصال روبیکا: `/rubika_connect`\n"
-        "- وضعیت روبیکا: `/rubika_status`\n\n"
-        "منوی فایل‌ها:\n"
-        "- شروع فایل ZIP: `/newbatch`\n"
-        "- پایان فایل ZIP: `/done`\n"
-        "- ارسال متن: `/sendtext متن`\n"
-        "- ارسال لینک: `/sendlink https://...`\n"
-        "- پاکسازی صف: `/delall`\n\n"
-        "منوی تنظیمات:\n"
-        "- حالت مستقیم: `/directmode on|off`\n"
-        "- safe mode: `/safemode on|off`\n\n"
-        "عیب‌یابی:\n"
-        "- وضعیت شبکه: `/netstatus`\n"
-        "- پنل ادمین: `/admin`\n"
-        "- حذف یک job: `/del <job_id>`\n\n"
-        "برای راهنمای تحلیل لاگ: `/loghelp`"
-    )
+    uid = message.from_user.id
+    await message.reply_text(tr(uid, "help_short"))
 
 
 @app.on_message(filters.private & filters.command("loghelp"))
 async def log_help_handler(client: Client, message: Message):
-    await message.reply_text(
-        "راهنمای تحلیل لاگ job:\n\n"
-        "1) ابتدا `job_id` را از پیام Queued بردار.\n"
-        "2) در bot logs دنبال `task_queued` با همان `job_id` بگرد.\n"
-        "3) در worker logs باید به‌ترتیب ببینی:\n"
-        "   `task_started` -> (`task_done` یا `task_failed`).\n"
-        "4) اگر `task_requeued` دیدی، مشکل شبکه/دسترسی بوده و job جدید ساخته شده.\n"
-        "5) برای اتصال روبیکا، eventهای `rubika_connect_ok` یا `rubika_connect_failed` را چک کن.\n\n"
-        "مسیر لاگ‌ها:\n"
-        "- `/opt/tele2rub/queue/bot_events.jsonl`\n"
-        "- `/opt/tele2rub/queue/worker_events.jsonl`\n"
-        "- `/tmp/tele2rub-installer.jsonl`"
-    )
+    uid = message.from_user.id
+    await message.reply_text(tr(uid, "loghelp_body"))
 
 
 @app.on_message(filters.private & filters.command("version"))
 async def version_handler(client: Client, message: Message):
-    await message.reply_text(f"telegramtorubika `{APP_VERSION}`")
+    uid = message.from_user.id
+    await message.reply_text(tr(uid, "version_line", version=APP_VERSION))
 
 
 @app.on_message(filters.private & filters.command("rubika_status"))
 async def rubika_status_handler(client: Client, message: Message):
-    session_name = get_user_session(message.from_user.id)
+    uid = message.from_user.id
+    session_name = get_user_session(uid)
     if not session_name:
-        await message.reply_text("روبیکا متصل نیست. از `/rubika_connect` استفاده کن.")
+        await message.reply_text(tr(uid, "rubika_not_connected"))
         return
-    await message.reply_text("در حال بررسی وضعیت واقعی اتصال روبیکا ...")
+    await message.reply_text(tr(uid, "rubika_checking"))
     ok_session, details = await asyncio.to_thread(check_rubika_session_sync, session_name)
     if ok_session:
-        await message.reply_text(
-            f"اتصال روبیکا فعال و معتبر است ✅\n"
-            f"session: `{session_name}`\n"
-            f"جزئیات: `{details}`"
-        )
+        await message.reply_text(tr(uid, "rubika_ok", session=session_name, details=details))
     else:
         await message.reply_text(
-            f"اتصال ذخیره‌شده معتبر نیست ❌\n"
-            f"session: `{session_name}`\n"
-            f"خطا: `{details}`\n\n"
-            f"لطفاً دوباره از دکمه «اتصال روبیکا» استفاده کن."
+            tr(uid, "rubika_invalid_session", session=session_name, details=details)
         )
 
 
@@ -960,16 +1279,11 @@ async def rubika_connect_handler(client: Client, message: Message):
     current_session = get_user_session(user_id)
     if current_session:
         await message.reply_text(
-            f"اکانت روبیکا از قبل متصل است.\n"
-            f"session: `{current_session}`\n\n"
-            f"برای اتصال مجدد، شماره جدید را ارسال کن."
+            tr(user_id, "rubika_already_connected", session=current_session)
         )
     set_state(user_id, {"step": "await_phone"})
     log_event("rubika_connect_started", user_id=user_id)
-    await message.reply_text(
-        "شماره روبیکا را با پیش‌شماره کشور ارسال کن.\n"
-        "مثال: `98912xxxxxxx`"
-    )
+    await message.reply_text(tr(user_id, "rubika_ask_phone"))
 
 
 @app.on_message(filters.private & filters.command("directmode"))
@@ -996,14 +1310,14 @@ async def direct_mode_handler(client: Client, message: Message):
 
 @app.on_message(filters.private & filters.command("netstatus"))
 async def netstatus_handler(client: Client, message: Message):
+    uid = message.from_user.id
     data = load_json(NETWORK_FILE, {"mode": "unknown", "reason": "", "updated_at": 0})
     mode = data.get("mode", "unknown")
-    reason = data.get("reason", "")
+    reason = data.get("reason", "") or "---"
     updated = data.get("updated_at", 0)
     await message.reply_text(
-        f"وضعیت شبکه: `{mode}`\n"
-        f"دلیل: `{reason or '---'}`\n"
-        f"آخرین بروزرسانی: `{updated}`"
+        tr(uid, "net_status", mode=mode, reason=reason, updated=updated),
+        parse_mode=None,
     )
 
 
@@ -1017,10 +1331,46 @@ def failed_count() -> int:
         return 0
 
 
+async def enqueue_rubika_text_message(message: Message, text_body: str) -> None:
+    user_id = message.from_user.id
+    session_name = get_user_session(user_id)
+    if not session_name:
+        await message.reply_text(tr(user_id, "rubika_not_connected"))
+        return
+    text_body = (text_body or "").strip()
+    if not text_body:
+        await message.reply_text(tr(user_id, "empty_message"))
+        return
+    task = {
+        "type": "text_message",
+        "text": text_body,
+        "rubika_session": session_name,
+    }
+    status = await message.reply_text(tr(user_id, "text_queueing"))
+    task["chat_id"] = message.chat.id
+    task["status_message_id"] = status.id
+    pushed = queue.push_task(task)
+    qpos = queue.queue_count_by_session(session_name)
+    log_event(
+        "task_queued",
+        user_id=user_id,
+        job_id=pushed.get("job_id"),
+        task_type="text_message",
+        direct_mode=is_direct_mode(user_id),
+    )
+    try:
+        await status.edit_text(
+            tr(user_id, "text_queued", job_id=pushed["job_id"], qpos=qpos),
+            parse_mode=None,
+        )
+    except MessageNotModified:
+        pass
+
+
 async def queue_or_confirm(message: Message, task: dict, summary: str):
     user_id = message.from_user.id
     if is_direct_mode(user_id):
-        status = await message.reply_text("Queued for processing...")
+        status = await message.reply_text(tr(user_id, "queued_processing"))
         task["chat_id"] = message.chat.id
         task["status_message_id"] = status.id
         pushed = queue.push_task(task)
@@ -1032,12 +1382,13 @@ async def queue_or_confirm(message: Message, task: dict, summary: str):
             task_type=task.get("type"),
             direct_mode=True,
         )
-        await status.edit_text(
-            f"در صف قرار گرفت ✅\n"
-            f"Job: `{pushed['job_id']}`\n"
-            f"جایگاه تقریبی در صف شما: `{qpos}`\n\n"
-            f"برای مشاهده جزئیات، «مدیریت صف» را بزن."
-        )
+        try:
+            await status.edit_text(
+                tr(user_id, "text_queued", job_id=pushed["job_id"], qpos=qpos),
+                parse_mode=None,
+            )
+        except MessageNotModified:
+            pass
         return
 
     set_state(
@@ -1048,8 +1399,9 @@ async def queue_or_confirm(message: Message, task: dict, summary: str):
             "pending_summary": summary,
         },
     )
+    suffix = tr(user_id, "confirm_send_suffix")
     await message.reply_text(
-        f"{summary}\n\nSend to Rubika now?",
+        f"{summary}\n\n{suffix}",
         reply_markup=InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("Confirm Send", callback_data="confirm_send")],
@@ -1086,14 +1438,18 @@ async def admin_handler(client: Client, message: Message):
         return
     net = load_json(NETWORK_FILE, {"mode": "unknown", "reason": "", "updated_at": 0})
     await message.reply_text(
-        "پنل ادمین:\n\n"
-        f"Queue total: `{queue.queue_count()}`\n"
-        f"Cancelled jobs: `{queue.cancelled_count()}`\n"
-        f"Deleted jobs: `{queue.deleted_count()}`\n"
-        f"Failed jobs: `{failed_count()}`\n"
-        f"Network mode: `{net.get('mode', 'unknown')}`\n"
-        f"Reason: `{net.get('reason', '')}`",
+        tr(
+            uid,
+            "admin_panel",
+            qt=queue.queue_count(),
+            cancelled=queue.cancelled_count(),
+            deleted=queue.deleted_count(),
+            failed=failed_count(),
+            net_mode=net.get("mode", "unknown"),
+            net_reason=net.get("reason", "") or "---",
+        ),
         reply_markup=build_admin_menu(uid),
+        parse_mode=None,
     )
 
 @app.on_message(filters.private & filters.command("safemode"))
@@ -1102,8 +1458,9 @@ async def safemode_handler(client: Client, message: Message):
 
     args = message.text.split(maxsplit=1)
 
+    uid = message.from_user.id
     if len(args) < 2:
-        await message.reply_text("برای تغییر وضعیت Safe Mode از `/safemode on` یا `/safemode off` استفاده کن.")
+        await message.reply_text(tr(uid, "safemode_usage"))
         return
 
     action = args[1].strip().lower()
@@ -1114,11 +1471,7 @@ async def safemode_handler(client: Client, message: Message):
         save_settings(settings)
         waiting_for_zip_password = True
 
-        await message.reply_text(
-            "Safe Mode فعال شد.\n\n"
-            "لطفا رمزی که می‌خواهید روی فایل‌های ZIP قرار بگیرد را ارسال کنید.\n"
-            "از این به بعد فایل‌ها قبل از ارسال به روبیکا با همین رمز ZIP می‌شوند."
-        )
+        await message.reply_text(tr(uid, "safemode_on"))
         return
 
     if action == "off":
@@ -1127,13 +1480,10 @@ async def safemode_handler(client: Client, message: Message):
         save_settings(settings)
         waiting_for_zip_password = False
 
-        await message.reply_text(
-            "Safe Mode غیرفعال شد.\n\n"
-            "از این به بعد فایل‌ها به‌صورت عادی ارسال می‌شوند."
-        )
+        await message.reply_text(tr(uid, "safemode_off"))
         return
 
-    await message.reply_text("دستور نامعتبر است. از `/safemode on` یا `/safemode off` استفاده کن.")
+    await message.reply_text(tr(uid, "safemode_bad"))
 
 
 @app.on_message(filters.private & filters.command("delall"))
@@ -1142,8 +1492,9 @@ async def clear_queue_handler(client: Client, message: Message, acting_user_id: 
     user_session = get_user_session(uid)
     tasks = [t for t in queue.all_tasks() if t.get("rubika_session") == user_session]
 
+    tr_uid = uid
     if not tasks:
-        await message.reply_text("صف خالی است.")
+        await message.reply_text(tr(tr_uid, "queue_empty"))
         return
 
     for task in tasks:
@@ -1162,13 +1513,16 @@ async def clear_queue_handler(client: Client, message: Message, acting_user_id: 
             await client.edit_message_text(
                 chat_id=task["chat_id"],
                 message_id=task["status_message_id"],
-                text="این مورد از صف حذف شد."
+                text=tr(task.get("chat_id") or tr_uid, "removed_from_queue"),
+                parse_mode=None,
             )
+        except MessageNotModified:
+            pass
         except Exception:
             pass
 
     queue.remove_tasks_by_session(user_session)
-    await message.reply_text("تمام موارد در صف پاک شد.")
+    await message.reply_text(tr(tr_uid, "queue_cleared_all"))
 
 @app.on_message(filters.private & filters.command("newbatch"))
 async def new_batch_handler(client: Client, message: Message):
@@ -1191,10 +1545,11 @@ async def new_batch_handler(client: Client, message: Message):
 async def done_batch_handler(client: Client, message: Message):
     batch = get_batch(message.from_user.id)
     files = batch.get("files", [])
+    uid = message.from_user.id
     if not batch.get("active") or not files:
-        await message.reply_text("جلسه فایل ZIP فعالی پیدا نشد یا فایل ندارد.")
+        await message.reply_text(tr(uid, "done_no_batch"))
         return
-    wizard = await message.reply_text("نام فایل ZIP را ارسال کن (بدون پسوند).")
+    wizard = await message.reply_text(tr(uid, "zip_name_prompt"))
     set_state(
         message.from_user.id,
         {
@@ -1262,7 +1617,7 @@ async def callback_handler(client: Client, callback_query):
         if not task:
             await callback_query.answer("Pending task not found", show_alert=True)
             return
-        status = await callback_query.message.reply_text("Queued for processing...")
+        status = await callback_query.message.reply_text(tr(user_id, "queued_processing"))
         task["chat_id"] = callback_query.message.chat.id
         task["status_message_id"] = status.id
         task = queue.push_task(task)
@@ -1275,12 +1630,13 @@ async def callback_handler(client: Client, callback_query):
             task_type=task.get("type"),
             direct_mode=False,
         )
-        await status.edit_text(
-            f"در صف قرار گرفت ✅\n"
-            f"Job: `{task['job_id']}`\n"
-            f"جایگاه تقریبی در صف شما: `{qpos}`\n\n"
-            f"برای مشاهده جزئیات، «مدیریت صف» را بزن."
-        )
+        try:
+            await status.edit_text(
+                tr(user_id, "text_queued", job_id=task["job_id"], qpos=qpos),
+                parse_mode=None,
+            )
+        except MessageNotModified:
+            pass
         await callback_query.answer("Queued")
         return
 
@@ -1296,76 +1652,26 @@ async def callback_handler(client: Client, callback_query):
 
 @app.on_message(filters.private & filters.command("sendtext"))
 async def send_text_handler(client: Client, message: Message):
-    session_name = get_user_session(message.from_user.id)
-    if not session_name:
-        await message.reply_text("ابتدا روبیکا را وصل کن: `/rubika_connect`")
-        return
+    uid = message.from_user.id
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
-        await message.reply_text("فرمت درست: `/sendtext متن`")
+        await message.reply_text(tr(uid, "sendtext_usage"))
         return
-    task = {
-        "type": "text_message",
-        "text": parts[1].strip(),
-        "rubika_session": session_name,
-    }
-    status = await message.reply_text("در حال قرار دادن متن در صف ...")
-    task["chat_id"] = message.chat.id
-    task["status_message_id"] = status.id
-    pushed = queue.push_task(task)
-    qpos = queue.queue_count_by_session(session_name)
-    log_event(
-        "task_queued",
-        user_id=message.from_user.id,
-        job_id=pushed.get("job_id"),
-        task_type="text_message",
-        direct_mode=is_direct_mode(message.from_user.id),
-    )
-    await status.edit_text(
-        f"متن در صف قرار گرفت ✅\n"
-        f"Job: `{pushed['job_id']}`\n"
-        f"جایگاه تقریبی در صف شما: `{qpos}`\n\n"
-        f"برای مشاهده جزئیات، «مدیریت صف» را بزن."
-    )
+    await enqueue_rubika_text_message(message, parts[1])
 
 
 @app.on_message(filters.private & filters.command("sendlink"))
 async def send_link_handler(client: Client, message: Message):
-    session_name = get_user_session(message.from_user.id)
-    if not session_name:
-        await message.reply_text("ابتدا روبیکا را وصل کن: `/rubika_connect`")
-        return
+    uid = message.from_user.id
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
-        await message.reply_text("فرمت درست: `/sendlink <url>`")
+        await message.reply_text(tr(uid, "sendlink_usage"))
         return
     url = extract_first_url(parts[1])
     if not url:
-        await message.reply_text("لینک نامعتبر است.")
+        await message.reply_text(tr(uid, "invalid_link"))
         return
-    task = {
-        "type": "text_message",
-        "text": url,
-        "rubika_session": session_name,
-    }
-    status = await message.reply_text("در حال قرار دادن لینک در صف ...")
-    task["chat_id"] = message.chat.id
-    task["status_message_id"] = status.id
-    pushed = queue.push_task(task)
-    qpos = queue.queue_count_by_session(session_name)
-    log_event(
-        "task_queued",
-        user_id=message.from_user.id,
-        job_id=pushed.get("job_id"),
-        task_type="text_message",
-        direct_mode=is_direct_mode(message.from_user.id),
-    )
-    await status.edit_text(
-        f"لینک در صف قرار گرفت ✅\n"
-        f"Job: `{pushed['job_id']}`\n"
-        f"جایگاه تقریبی در صف شما: `{qpos}`\n\n"
-        f"برای مشاهده جزئیات، «مدیریت صف» را بزن."
-    )
+    await enqueue_rubika_text_message(message, url)
 
 
 @app.on_message(filters.private & filters.command("queue"))
@@ -1399,11 +1705,13 @@ async def queue_manage_handler(
     )
     if edit_existing:
         try:
-            await message.edit_text(summary, reply_markup=kb)
+            await message.edit_text(summary, reply_markup=kb, parse_mode=None)
+            return
+        except MessageNotModified:
             return
         except Exception:
             pass
-    await message.reply_text(summary, reply_markup=kb)
+    await message.reply_text(summary, reply_markup=kb, parse_mode=None)
 
 
 @app.on_message(filters.private & filters.command("del"))
@@ -1517,10 +1825,12 @@ async def text_handler(client: Client, message: Message):
         "done batch": "/done",
         "پایان بچ": "/done",
         "پایان بچ فایل zip": "/done",
-        "send text": "/sendtext",
-        "ارسال متن": "/sendtext",
-        "send link": "/sendlink",
-        "ارسال لینک": "/sendlink",
+        "send text or link": "/quick_send_prompt",
+        "ارسال متن یا لینک": "/quick_send_prompt",
+        "send text": "/quick_send_prompt",
+        "ارسال متن": "/quick_send_prompt",
+        "send link": "/quick_send_prompt",
+        "ارسال لینک": "/quick_send_prompt",
         "delete all": "/delall",
         "حذف همه": "/delall",
         "queue management": "/queue",
@@ -1596,26 +1906,14 @@ async def text_handler(client: Client, message: Message):
         message.text = "/directmode off"
         await direct_mode_handler(client, message)
         return
-    if mapped in {"/sendtext", "/sendlink"}:
-        prompt_map = {
-            "/sendtext": ("await_sendtext_input", tr(user_id, "prompt_sendtext")),
-            "/sendlink": ("await_sendlink_input", tr(user_id, "prompt_sendlink")),
-        }
-        step, prompt = prompt_map[mapped]
-        set_state(user_id, {"step": step})
-        await message.reply_text(prompt)
+    if mapped == "/quick_send_prompt":
+        set_state(user_id, {"step": "await_quick_message"})
+        await message.reply_text(tr(user_id, "prompt_quick_message"))
         return
 
-    if state.get("step") == "await_sendtext_input":
-        set_state(user_id, {})
-        message.text = f"/sendtext {text}"
-        await send_text_handler(client, message)
-        return
-
-    if state.get("step") == "await_sendlink_input":
-        set_state(user_id, {})
-        message.text = f"/sendlink {text}"
-        await send_link_handler(client, message)
+    if state.get("step") == "await_quick_message":
+        clear_state(user_id)
+        await enqueue_rubika_text_message(message, text)
         return
 
     if state.get("step") == "await_phone":
@@ -1634,7 +1932,7 @@ async def text_handler(client: Client, message: Message):
                         "phone_number": phone,
                     },
                 )
-                await message.reply_text("این شماره نیاز به PassKey دارد. PassKey روبیکا را ارسال کن.")
+                await message.reply_text(tr(user_id, "rubika_passkey_needed"))
                 return
             if not phone_hash:
                 raise RuntimeError(f"phone_code_hash پیدا نشد. status={status or 'unknown'}")
@@ -1647,10 +1945,10 @@ async def text_handler(client: Client, message: Message):
                     "phone_code_hash": phone_hash,
                 },
             )
-            await message.reply_text("کد ارسال شد. کد تایید روبیکا را بفرست.")
+            await message.reply_text(tr(user_id, "rubika_code_sent"))
         except Exception as e:
             clear_state(user_id)
-            await message.reply_text(f"خطا در ارسال کد روبیکا: {e}")
+            await message.reply_text(tr(user_id, "rubika_send_code_error", error=str(e)))
         return
 
     if state.get("step") == "await_pass_key":
@@ -1672,10 +1970,10 @@ async def text_handler(client: Client, message: Message):
                     "phone_code_hash": phone_hash,
                 },
             )
-            await message.reply_text("کد ارسال شد. کد تایید روبیکا را بفرست.")
+            await message.reply_text(tr(user_id, "rubika_code_sent"))
         except Exception as e:
             clear_state(user_id)
-            await message.reply_text(f"خطا در ارسال کد روبیکا: {e}")
+            await message.reply_text(tr(user_id, "rubika_send_code_error", error=str(e)))
         return
 
     if state.get("step") == "await_code":
@@ -1697,12 +1995,12 @@ async def text_handler(client: Client, message: Message):
             }
             save_users(users)
             clear_state(user_id)
-            await message.reply_text("روبیکا با موفقیت متصل شد ✅")
+            await message.reply_text(tr(user_id, "rubika_connected_ok"))
             log_event("rubika_connect_ok", user_id=user_id, session=session_name)
         except Exception as e:
             clear_state(user_id)
             log_event("rubika_connect_failed", user_id=user_id, error=str(e))
-            await message.reply_text(f"کد تایید نامعتبر یا خطای ورود: {e}")
+            await message.reply_text(tr(user_id, "rubika_bad_code", error=str(e)))
         return
 
     if state.get("step") == "await_zip_name":
@@ -1711,7 +2009,7 @@ async def text_handler(client: Client, message: Message):
         await edit_wizard(
             state.get("wizard_chat_id", message.chat.id),
             int(state.get("wizard_message_id", 0) or 0),
-            "سایز هر پارت (MB) را بفرست. مثال: 1900",
+            tr(user_id, "part_mb_prompt"),
         )
         set_state(
             user_id,
@@ -1729,17 +2027,17 @@ async def text_handler(client: Client, message: Message):
         try:
             part_mb = int(text.strip())
         except Exception:
-            await message.reply_text("عدد معتبر بفرست. مثال: 1900")
+            await message.reply_text(tr(user_id, "part_mb_invalid"))
             return
         if part_mb < 50:
-            await message.reply_text("حداقل سایز پارت 50MB است.")
+            await message.reply_text(tr(user_id, "part_mb_min"))
             return
         await safe_delete_user_message(message)
         files = state.get("batch_files", [])
         session_name = get_user_session(user_id)
         file_paths = [Path(p) for p in files if Path(p).exists()]
         if not file_paths:
-            await message.reply_text("فایلی برای ساخت ZIP پیدا نشد.")
+            await message.reply_text(tr(user_id, "zip_no_files"))
             clear_state(user_id)
             clear_batch(user_id)
             return
@@ -1748,10 +2046,7 @@ async def text_handler(client: Client, message: Message):
         zip_path = make_bundle_zip_local(file_paths, state.get("zip_name", "bundle"), zip_password)
         total_size = sum(p.stat().st_size for p in file_paths if p.exists())
         if zip_path.stat().st_size > 45 * 1024 * 1024:
-            await message.reply_text(
-                "⚠️ حجم فایل ZIP بزرگ است. تلگرام ممکن است ارسال فایل در چت را رد کند؛ "
-                "فایل روی سرور آماده است و می‌تواند به روبیکا ارسال شود."
-            )
+            await message.reply_text(tr(user_id, "zip_large_warn"))
         for p in file_paths:
             try:
                 p.unlink()
@@ -1760,20 +2055,23 @@ async def text_handler(client: Client, message: Message):
         try:
             await message.reply_document(
                 str(zip_path),
-                caption=(
-                    f"فایل ZIP آماده شد ✅\n"
-                    f"تعداد فایل‌ها: `{len(file_paths)}`\n"
-                    f"حجم کل ورودی: `{pretty_size(total_size)}`\n"
-                    f"حجم ZIP: `{pretty_size(zip_path.stat().st_size)}`"
+                caption=tr(
+                    user_id,
+                    "zip_ready_caption",
+                    n=len(file_paths),
+                    insize=pretty_size(total_size),
+                    zsize=pretty_size(zip_path.stat().st_size),
                 ),
             )
         except Exception:
             await message.reply_text(
-                f"فایل ZIP آماده شد ✅\n"
-                f"تعداد فایل‌ها: `{len(file_paths)}`\n"
-                f"حجم کل ورودی: `{pretty_size(total_size)}`\n"
-                f"حجم ZIP: `{pretty_size(zip_path.stat().st_size)}`\n"
-                f"(ارسال فایل ZIP در تلگرام ناموفق بود، اما روی سرور آماده است)"
+                tr(
+                    user_id,
+                    "zip_ready_no_doc",
+                    n=len(file_paths),
+                    insize=pretty_size(total_size),
+                    zsize=pretty_size(zip_path.stat().st_size),
+                )
             )
         task = {
             "type": "local_file",
@@ -1787,14 +2085,18 @@ async def text_handler(client: Client, message: Message):
         }
         clear_state(user_id)
         clear_batch(user_id)
-        await queue_or_confirm(message, task, f"ZIP آماده شد: `{zip_path.name}`\nآیا می‌خواهی به روبیکا ارسال شود؟")
+        await queue_or_confirm(
+            message,
+            task,
+            tr(user_id, "zip_queue_summary", name=zip_path.name),
+        )
         return
 
     if waiting_for_zip_password:
         password = text.strip()
 
         if not password:
-            await message.reply_text("رمز نمی‌تواند خالی باشد. لطفاً یک رمز معتبر ارسال کنید.")
+            await message.reply_text(tr(user_id, "password_empty"))
             return
 
         settings = load_settings()
@@ -1804,10 +2106,7 @@ async def text_handler(client: Client, message: Message):
 
         waiting_for_zip_password = False
 
-        await message.reply_text(
-            "رمز ذخیره شد.\n\n"
-            "از این به بعد فایل‌ها قبل از ارسال به روبیکا به‌صورت ZIP رمزدار آماده می‌شوند."
-        )
+        await message.reply_text(tr(user_id, "password_saved_zip"))
         return
 
     if is_direct_mode(user_id):
@@ -1864,25 +2163,22 @@ async def media_handler(client: Client, message: Message):
     user_id = message.from_user.id
     session_name = get_user_session(user_id)
     if not session_name:
-        await message.reply_text("ابتدا روبیکا را متصل کن: `/rubika_connect`")
+        await message.reply_text(tr(user_id, "media_need_rubika"))
         return
 
     media_type, media = get_media(message)
     if not media:
-        await message.reply_text("فایل قابل پردازش نیست.")
+        await message.reply_text(tr(user_id, "media_bad_type"))
         return
 
     download_name = build_download_filename(message, media_type, media)
     download_path = DOWNLOAD_DIR / download_name
 
-    status = await message.reply_text(
-        "فایل دریافت شد.\n\n"
-        "وضعیت: آماده‌سازی برای دانلود از تلگرام..."
-    )
+    status = await message.reply_text(tr(user_id, "media_download_status"))
 
     try:
         started_at = time.time()
-        progress_state = {"last_update": 0}
+        progress_state = {"last_update": 0, "user_id": user_id}
 
         downloaded = await client.download_media(
             message,
@@ -1908,9 +2204,8 @@ async def media_handler(client: Client, message: Message):
             batch["files"] = files
             set_batch(user_id, batch)
             await status.edit_text(
-                f"✅ فایل به جلسه ZIP اضافه شد.\n"
-                f"تعداد فایل‌های فعلی: `{len(files)}`\n\n"
-                f"فایل‌های بیشتری بفرست یا «پایان فایل ZIP» را بزن."
+                tr(user_id, "media_zip_added", n=len(files)),
+                parse_mode=None,
             )
             return
 
@@ -1926,9 +2221,19 @@ async def media_handler(client: Client, message: Message):
         }
 
         await status.edit_text(
-            f"File ready: `{download_name}` ({pretty_size(file_size)})\nWaiting for your confirmation."
+            tr(
+                user_id,
+                "media_file_ready",
+                name=download_name,
+                size=pretty_size(file_size),
+            ),
+            parse_mode=None,
         )
-        await queue_or_confirm(message, task, f"File prepared: `{download_name}`")
+        await queue_or_confirm(
+            message,
+            task,
+            tr(user_id, "file_prepared_summary", name=download_name),
+        )
         log_event(
             "media_prepared",
             user_id=user_id,
@@ -1939,7 +2244,7 @@ async def media_handler(client: Client, message: Message):
 
     except Exception as e:
         log_event("media_prepare_failed", user_id=user_id, error=str(e))
-        await status.edit_text(f"خطا: {str(e)}")
+        await status.edit_text(tr(user_id, "media_error", error=str(e)), parse_mode=None)
 
 def clear_old_status():
     try:
@@ -1952,5 +2257,6 @@ if __name__ == "__main__":
     clear_old_status()
     app.start()
     app.loop.create_task(status_watcher())
+    app.loop.create_task(maybe_broadcast_update())
     idle()
     app.stop()

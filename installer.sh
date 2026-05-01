@@ -191,7 +191,11 @@ clone_or_update_repo(){
     --exclude "venv" \
     --exclude "queue" \
     --exclude "downloads" \
+    --exclude "*.session" \
+    --exclude "*.session-journal" \
+    --exclude "*.sqlite" \
     "${tmp_clone}/" "${dir}/" || return 1
+  # *.session / *.sqlite = Telegram + Rubika/pyrogram sessions (avoid wiping logins on update)
   run_cmd "cleanup temp clone" rm -rf "$tmp_clone" || true
 }
 
