@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import time
 import pyzipper
 from pathlib import Path
@@ -51,6 +52,32 @@ DISABLE_UPDATE_BROADCAST = os.getenv("DISABLE_UPDATE_BROADCAST", "").strip().low
     "true",
     "yes",
 )
+
+
+def max_file_bytes() -> Optional[int]:
+    """If set, reject queued uploads larger than this (from MAX_FILE_MB in .env). 0 or empty = no limit."""
+    raw = (os.getenv("MAX_FILE_MB") or "").strip()
+    if not raw or raw == "0":
+        return None
+    try:
+        mb = int(raw)
+        if mb <= 0:
+            return None
+        return mb * 1024 * 1024
+    except ValueError:
+        return None
+
+
+def max_file_mb_display() -> str:
+    b = max_file_bytes()
+    if b is None:
+        return "∞"
+    return str(b // (1024 * 1024))
+
+
+def fmt_mb_bytes(n: int) -> str:
+    return f"{n / (1024 * 1024):.1f}"
+
 
 ADMIN_IDS = {
     int(x.strip())
@@ -123,6 +150,7 @@ I18N = {
         "btn_inline_failed": "نمایش Failed",
         "btn_inline_clear": "پاکسازی صف من",
         "btn_inline_recent": "آخرین کارها",
+        "btn_inline_faildetail": "جزئیات خطا",
         "queue_kb_refresh": "بروزرسانی شد",
         "queue_kb_cleared": "صف پاک شد",
         "directmode_usage": "استفاده: `/directmode on` یا `/directmode off`",
@@ -302,6 +330,12 @@ I18N = {
         "file_prepared_summary": "فایل آماده شد: `{name}`",
         "queued_processing": "Queued for processing...",
         "confirm_send_suffix": "به روبیکا همین حالا ارسال شود؟",
+        "failed_detail_title": "آخرین خطاهای ثبت‌شده برای نشست شما:",
+        "confirm_cancelled": "ارسال لغو شد.",
+        "cleanup_done": "پاکسازی `downloads/`: {n} فایل، حدود {mb} MB آزاد شد.",
+        "direct_need_rubika": "برای حالت مستقیم اول `/rubika_connect` بزن.",
+        "file_too_large": "فایل از سقف مجاز بزرگ‌تر است (حداکثر `{max_mb}` مگابایت). حجم این فایل: ~`{size_mb}` مگابایت. در `.env` مقدار `MAX_FILE_MB` را ببین یا فایل را کوچک‌تر کن.",
+        "admin_max_file": "`MAX_FILE_MB` (سقف آپلود): `{mb}` (`0` یا خالی = بدون سقف)",
     },
     "en": {
         "welcome": (
@@ -353,6 +387,7 @@ I18N = {
         "btn_inline_failed": "Failed",
         "btn_inline_clear": "Clear my queue",
         "btn_inline_recent": "Recent jobs",
+        "btn_inline_faildetail": "Error details",
         "queue_kb_refresh": "Refreshed",
         "queue_kb_cleared": "Queue cleared",
         "directmode_usage": "Use: /directmode on or /directmode off",
@@ -532,6 +567,12 @@ I18N = {
         "file_prepared_summary": "File prepared: `{name}`",
         "queued_processing": "Queued for processing...",
         "confirm_send_suffix": "Send to Rubika now?",
+        "failed_detail_title": "Recent failures for your Rubika session:",
+        "confirm_cancelled": "Send cancelled.",
+        "cleanup_done": "Cleaned `downloads/`: {n} files, ~{mb} MB freed.",
+        "direct_need_rubika": "Link Rubika first: `/rubika_connect`",
+        "file_too_large": "File exceeds the configured limit (max `{max_mb}` MB). This file is ~`{size_mb}` MB. Adjust `MAX_FILE_MB` in `.env` or send a smaller file.",
+        "admin_max_file": "`MAX_FILE_MB` cap: `{mb}` (`0` or empty = unlimited)",
     },
 }
 
@@ -615,6 +656,66 @@ def recent_jobs_summary(user_id: int, limit: int = 10) -> str:
         else:
             lines.append(f"🔄 `{jid}` requeued")
     return "\n".join(lines)
+
+
+def dir_bytes(path: Path) -> int:
+    total = 0
+    if not path.exists():
+        return 0
+    try:
+        for f in path.rglob("*"):
+            if f.is_file():
+                try:
+                    total += f.stat().st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
+
+
+def admin_disk_report_text() -> str:
+    du = shutil.disk_usage(BASE_DIR)
+    dl = dir_bytes(DOWNLOAD_DIR)
+    qz = dir_bytes(QUEUE_DIR)
+    return (
+        f"💾 Storage\n"
+        f"- Free / total: `{pretty_size(float(du.free))}` / `{pretty_size(float(du.total))}`\n"
+        f"- `{DOWNLOAD_DIR.name}/`: `{pretty_size(float(dl))}`\n"
+        f"- `{QUEUE_DIR.name}/`: `{pretty_size(float(qz))}`"
+    )
+
+
+def recent_failed_detail_text(session: Optional[str], limit: int = 8) -> str:
+    if not session or not FAILED_FILE.exists():
+        return "—"
+    rows = []
+    try:
+        with open(FAILED_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                task = row.get("task") or {}
+                if task.get("rubika_session") != session:
+                    continue
+                jid = task.get("job_id", "?")
+                fn = task.get("file_name") or ""
+                if not fn and task.get("path"):
+                    fn = Path(str(task.get("path"))).name
+                if not fn:
+                    fn = task.get("type", "?")
+                err = (row.get("error") or "")[:900]
+                rows.append(f"`{jid}` `{fn}`\n`{err}`")
+                if len(rows) >= limit:
+                    break
+    except Exception:
+        return "—"
+    return "\n\n".join(rows) if rows else "—"
 
 
 def build_main_menu(user_id: int) -> ReplyKeyboardMarkup:
@@ -1172,7 +1273,9 @@ async def status_watcher():
                 if percent is not None:
                     text += f"\n\n`{progress_bar(float(percent))}` `{float(percent):.1f}%`"
                 try:
-                    await app.edit_message_text(chat_id, msg_id, text)
+                    await app.edit_message_text(chat_id, msg_id, text, parse_mode=None)
+                except MessageNotModified:
+                    pass
                 except Exception:
                     pass
         except Exception:
@@ -1367,9 +1470,40 @@ async def enqueue_rubika_text_message(message: Message, text_body: str) -> None:
         pass
 
 
-async def queue_or_confirm(message: Message, task: dict, summary: str):
+async def queue_or_confirm(
+    message: Message,
+    task: dict,
+    summary: str,
+    status_message: Optional[Message] = None,
+):
     user_id = message.from_user.id
     if is_direct_mode(user_id):
+        anchor = status_message
+        if anchor:
+            task["chat_id"] = message.chat.id
+            task["status_message_id"] = anchor.id
+            try:
+                await anchor.edit_text(tr(user_id, "text_queueing"), parse_mode=None)
+            except Exception:
+                pass
+            pushed = queue.push_task(task)
+            qpos = queue.queue_count_by_session(task.get("rubika_session") or "")
+            log_event(
+                "task_queued",
+                user_id=user_id,
+                job_id=pushed.get("job_id"),
+                task_type=task.get("type"),
+                direct_mode=True,
+            )
+            try:
+                await anchor.edit_text(
+                    tr(user_id, "text_queued", job_id=pushed["job_id"], qpos=qpos),
+                    parse_mode=None,
+                )
+            except MessageNotModified:
+                pass
+            return
+
         status = await message.reply_text(tr(user_id, "queued_processing"))
         task["chat_id"] = message.chat.id
         task["status_message_id"] = status.id
@@ -1397,18 +1531,24 @@ async def queue_or_confirm(message: Message, task: dict, summary: str):
             "step": "await_send_confirm",
             "pending_task": task,
             "pending_summary": summary,
+            "confirm_target_msg_id": status_message.id if status_message else None,
         },
     )
     suffix = tr(user_id, "confirm_send_suffix")
-    await message.reply_text(
-        f"{summary}\n\n{suffix}",
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("Confirm Send", callback_data="confirm_send")],
-                [InlineKeyboardButton("Cancel", callback_data="cancel_send")],
-            ]
-        ),
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Confirm Send", callback_data="confirm_send")],
+            [InlineKeyboardButton("Cancel", callback_data="cancel_send")],
+        ]
     )
+    body = f"{summary}\n\n{suffix}"
+    if status_message:
+        try:
+            await status_message.edit_text(body, reply_markup=kb, parse_mode=None)
+        except Exception:
+            await message.reply_text(body, reply_markup=kb)
+    else:
+        await message.reply_text(body, reply_markup=kb)
     log_event(
         "task_confirm_requested",
         user_id=user_id,
@@ -1447,8 +1587,35 @@ async def admin_handler(client: Client, message: Message):
             failed=failed_count(),
             net_mode=net.get("mode", "unknown"),
             net_reason=net.get("reason", "") or "---",
-        ),
+        )
+        + "\n"
+        + tr(uid, "admin_max_file", mb=max_file_mb_display())
+        + "\n\n"
+        + admin_disk_report_text(),
         reply_markup=build_admin_menu(uid),
+        parse_mode=None,
+    )
+
+
+@app.on_message(filters.private & filters.command("cleanup_downloads"))
+async def cleanup_downloads_handler(client: Client, message: Message):
+    uid = message.from_user.id
+    if uid not in ADMIN_IDS:
+        await message.reply_text(tr(uid, "admin_denied"))
+        return
+    n = 0
+    freed = 0
+    for p in DOWNLOAD_DIR.glob("*"):
+        try:
+            if p.is_file():
+                freed += p.stat().st_size
+                p.unlink()
+                n += 1
+        except OSError:
+            pass
+    log_event("admin_cleanup_downloads", user_id=uid, files=n, bytes_freed=freed)
+    await message.reply_text(
+        tr(uid, "cleanup_done", n=n, mb=f"{freed / (1024 * 1024):.2f}"),
         parse_mode=None,
     )
 
@@ -1605,6 +1772,16 @@ async def callback_handler(client: Client, callback_query):
         if action == "failed":
             await callback_query.answer(f"Failed: {failed_count()}", show_alert=True)
             return
+        if action == "faildetail":
+            await callback_query.answer()
+            sess = get_user_session(user_id)
+            body = recent_failed_detail_text(sess, limit=8)
+            title = tr(user_id, "failed_detail_title")
+            await callback_query.message.reply_text(
+                f"{title}\n\n{body}",
+                parse_mode=None,
+            )
+            return
         if action == "history":
             await callback_query.answer()
             body = recent_jobs_summary(user_id)
@@ -1617,9 +1794,9 @@ async def callback_handler(client: Client, callback_query):
         if not task:
             await callback_query.answer("Pending task not found", show_alert=True)
             return
-        status = await callback_query.message.reply_text(tr(user_id, "queued_processing"))
-        task["chat_id"] = callback_query.message.chat.id
-        task["status_message_id"] = status.id
+        anchor = callback_query.message
+        task["chat_id"] = anchor.chat.id
+        task["status_message_id"] = anchor.id
         task = queue.push_task(task)
         qpos = queue.queue_count_by_session(task.get("rubika_session") or "")
         clear_state(user_id)
@@ -1631,8 +1808,9 @@ async def callback_handler(client: Client, callback_query):
             direct_mode=False,
         )
         try:
-            await status.edit_text(
+            await anchor.edit_text(
                 tr(user_id, "text_queued", job_id=task["job_id"], qpos=qpos),
+                reply_markup=None,
                 parse_mode=None,
             )
         except MessageNotModified:
@@ -1643,7 +1821,14 @@ async def callback_handler(client: Client, callback_query):
     if data == "cancel_send" and state.get("step") == "await_send_confirm":
         clear_state(user_id)
         log_event("task_confirm_cancelled", user_id=user_id)
-        await callback_query.message.reply_text("Canceled.")
+        try:
+            await callback_query.message.edit_text(
+                tr(user_id, "confirm_cancelled"),
+                reply_markup=None,
+                parse_mode=None,
+            )
+        except Exception:
+            await callback_query.message.reply_text(tr(user_id, "confirm_cancelled"))
         await callback_query.answer("Canceled")
         return
 
@@ -1700,6 +1885,7 @@ async def queue_manage_handler(
                 InlineKeyboardButton(tr(user_id, "btn_inline_failed"), callback_data="queue:failed"),
             ],
             [InlineKeyboardButton(tr(user_id, "btn_inline_recent"), callback_data="queue:history")],
+            [InlineKeyboardButton(tr(user_id, "btn_inline_faildetail"), callback_data="queue:faildetail")],
             [InlineKeyboardButton(tr(user_id, "btn_inline_clear"), callback_data="queue:clearall")],
         ]
     )
@@ -2045,39 +2231,59 @@ async def text_handler(client: Client, message: Message):
         zip_password = settings.get("zip_password", "") if settings.get("safe_mode", False) else ""
         zip_path = make_bundle_zip_local(file_paths, state.get("zip_name", "bundle"), zip_password)
         total_size = sum(p.stat().st_size for p in file_paths if p.exists())
-        if zip_path.stat().st_size > 45 * 1024 * 1024:
+        zip_sz = zip_path.stat().st_size
+        lim = max_file_bytes()
+        if lim and zip_sz > lim:
+            try:
+                zip_path.unlink()
+            except Exception:
+                pass
+            await message.reply_text(
+                tr(
+                    user_id,
+                    "file_too_large",
+                    max_mb=max_file_mb_display(),
+                    size_mb=fmt_mb_bytes(zip_sz),
+                ),
+                parse_mode=None,
+            )
+            clear_state(user_id)
+            clear_batch(user_id)
+            return
+        if zip_sz > 45 * 1024 * 1024:
             await message.reply_text(tr(user_id, "zip_large_warn"))
         for p in file_paths:
             try:
                 p.unlink()
             except Exception:
                 pass
+        zip_status_msg = None
         try:
-            await message.reply_document(
+            zip_status_msg = await message.reply_document(
                 str(zip_path),
                 caption=tr(
                     user_id,
                     "zip_ready_caption",
                     n=len(file_paths),
                     insize=pretty_size(total_size),
-                    zsize=pretty_size(zip_path.stat().st_size),
+                    zsize=pretty_size(zip_sz),
                 ),
             )
         except Exception:
-            await message.reply_text(
+            zip_status_msg = await message.reply_text(
                 tr(
                     user_id,
                     "zip_ready_no_doc",
                     n=len(file_paths),
                     insize=pretty_size(total_size),
-                    zsize=pretty_size(zip_path.stat().st_size),
+                    zsize=pretty_size(zip_sz),
                 )
             )
         task = {
             "type": "local_file",
             "path": str(zip_path),
             "file_name": zip_path.name,
-            "file_size": zip_path.stat().st_size,
+            "file_size": zip_sz,
             "part_size_mb": part_mb,
             "rubika_session": session_name,
             "safe_mode": False,
@@ -2089,6 +2295,7 @@ async def text_handler(client: Client, message: Message):
             message,
             task,
             tr(user_id, "zip_queue_summary", name=zip_path.name),
+            status_message=zip_status_msg,
         )
         return
 
@@ -2112,14 +2319,14 @@ async def text_handler(client: Client, message: Message):
     if is_direct_mode(user_id):
         session_name = get_user_session(user_id)
         if not session_name:
-            await message.reply_text("برای حالت مستقیم اول /rubika_connect بزن.")
+            await message.reply_text(tr(user_id, "direct_need_rubika"))
             return
         task = {
             "type": "text_message",
             "text": text,
             "rubika_session": session_name,
         }
-        status = await message.reply_text("در حال قرار دادن در صف ...")
+        status = await message.reply_text(tr(user_id, "text_queueing"))
         task["chat_id"] = message.chat.id
         task["status_message_id"] = status.id
         pushed = queue.push_task(task)
@@ -2131,12 +2338,13 @@ async def text_handler(client: Client, message: Message):
             task_type="text_message",
             direct_mode=True,
         )
-        await status.edit_text(
-            f"در صف قرار گرفت ✅\n"
-            f"Job: `{pushed['job_id']}`\n"
-            f"جایگاه تقریبی در صف شما: `{qpos}`\n\n"
-            f"برای مشاهده جزئیات، «مدیریت صف» را بزن."
-        )
+        try:
+            await status.edit_text(
+                tr(user_id, "text_queued", job_id=pushed["job_id"], qpos=qpos),
+                parse_mode=None,
+            )
+        except MessageNotModified:
+            pass
         return
 
     url = extract_first_url(text)
@@ -2195,6 +2403,22 @@ async def media_handler(client: Client, message: Message):
             raise RuntimeError("Downloaded file not found.")
 
         file_size = downloaded_path.stat().st_size
+        lim = max_file_bytes()
+        if lim and file_size > lim:
+            try:
+                downloaded_path.unlink()
+            except Exception:
+                pass
+            await status.edit_text(
+                tr(
+                    user_id,
+                    "file_too_large",
+                    max_mb=max_file_mb_display(),
+                    size_mb=fmt_mb_bytes(file_size),
+                ),
+                parse_mode=None,
+            )
+            return
         settings = load_settings()
         batch = get_batch(user_id)
 
@@ -2233,6 +2457,7 @@ async def media_handler(client: Client, message: Message):
             message,
             task,
             tr(user_id, "file_prepared_summary", name=download_name),
+            status_message=status,
         )
         log_event(
             "media_prepared",

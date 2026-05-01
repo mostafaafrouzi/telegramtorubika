@@ -1,0 +1,23 @@
+# Example: Telegram bot only (split from worker to reduce RAM spikes).
+# Copy to /etc/systemd/system/tele2rub-bot.service, adjust paths, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now tele2rub-bot.service
+#
+# Stop using combined main.py / tele2rub.service for this app dir if you enable this.
+
+[Unit]
+Description=telegramtorubika Telegram bot (telebot.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/tele2rub
+EnvironmentFile=-/opt/tele2rub/.env
+ExecStart=/opt/tele2rub/venv/bin/python /opt/tele2rub/telebot.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

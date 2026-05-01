@@ -98,55 +98,90 @@ ask_yn(){
 ensure_root(){ [[ "$EUID" -eq 0 ]] || { err "Run as root: sudo bash installer.sh"; exit 1; }; }
 os_check(){ [[ -f /etc/os-release ]] || { err "Unsupported OS"; exit 1; }; source /etc/os-release; info "OS: ${PRETTY_NAME:-unknown}"; }
 
-INST_NAMES=()
+INST_LABELS=()
 INST_DIRS=()
 INST_USERS=()
+INST_BASES=()
+INST_SPLITS=()
 
 discover_instances(){
-  INST_NAMES=()
+  INST_LABELS=()
   INST_DIRS=()
   INST_USERS=()
-  local f name dir user
+  INST_BASES=()
+  INST_SPLITS=()
+  local f name dir user ex base
+  declare -A dir_has_combined dir_combined_name dir_combined_user
+  declare -A dir_split_base dir_split_user
+
   for f in /etc/systemd/system/*.service; do
     [[ -f "$f" ]] || continue
     name="$(basename "$f" .service)"
     dir="$(grep '^WorkingDirectory=' "$f" | head -n1 | sed 's/^WorkingDirectory=//' || true)"
     user="$(grep '^User=' "$f" | head -n1 | sed 's/^User=//' || true)"
-    [[ -z "$dir" ]] && continue
-    [[ -f "$dir/main.py" ]] || continue
-    INST_NAMES+=("$name")
+    [[ -z "$dir" ]] || [[ ! -f "$dir/main.py" ]] && continue
+    ex="$(grep '^ExecStart=' "$f" | head -n1 || true)"
+    if [[ "$ex" == *'/main.py'* ]] || [[ "$ex" == *' main.py'* ]]; then
+      dir_has_combined["$dir"]=1
+      dir_combined_name["$dir"]="$name"
+      dir_combined_user["$dir"]="${user:-root}"
+    elif [[ "$ex" == *telebot.py* ]]; then
+      base="${name%-bot}"
+      [[ "$base" == "$name" ]] && base="$name"
+      dir_split_base["$dir"]="$base"
+      dir_split_user["$dir"]="${user:-root}"
+    fi
+  done
+
+  for dir in "${!dir_has_combined[@]}"; do
     INST_DIRS+=("$dir")
-    INST_USERS+=("${user:-root}")
+    INST_USERS+=("${dir_combined_user[$dir]}")
+    INST_BASES+=("${dir_combined_name[$dir]}")
+    INST_SPLITS+=(0)
+    INST_LABELS+=("${dir_combined_name[$dir]}")
+  done
+
+  for dir in "${!dir_split_base[@]}"; do
+    [[ -n "${dir_has_combined[$dir]:-}" ]] && continue
+    INST_DIRS+=("$dir")
+    INST_USERS+=("${dir_split_user[$dir]}")
+    INST_BASES+=("${dir_split_base[$dir]}")
+    INST_SPLITS+=(1)
+    INST_LABELS+=("${dir_split_base[$dir]} (split)")
   done
 }
 
 select_instance(){
   discover_instances
-  if [[ ${#INST_NAMES[@]} -eq 0 ]]; then
+  if [[ ${#INST_DIRS[@]} -eq 0 ]]; then
     warn "No installed Tele2Rub instances were auto-detected."
     return 1
   fi
   echo
   echo "Detected instances:"
   local i
-  for i in "${!INST_NAMES[@]}"; do
-    echo "$((i+1))) ${INST_NAMES[$i]}  dir=${INST_DIRS[$i]}  user=${INST_USERS[$i]}"
+  for i in "${!INST_DIRS[@]}"; do
+    echo "$((i+1))) ${INST_LABELS[$i]}  dir=${INST_DIRS[$i]}  user=${INST_USERS[$i]}  systemd=${INST_BASES[$i]}  split=${INST_SPLITS[$i]}"
   done
   echo
   if [[ ! -t 0 ]]; then
-    SELECTED_NAME="${INST_NAMES[0]}"
+    SELECTED_LABEL="${INST_LABELS[0]}"
     SELECTED_DIR="${INST_DIRS[0]}"
     SELECTED_USER="${INST_USERS[0]}"
-    info "Non-interactive mode: auto-selected instance ${SELECTED_NAME}"
+    SELECTED_BASE="${INST_BASES[0]}"
+    SELECTED_SPLIT="${INST_SPLITS[0]}"
+    info "Non-interactive mode: auto-selected instance ${SELECTED_LABEL}"
     return 0
   fi
   local pick
   while true; do
-    read -r -p "Choose instance [1-${#INST_NAMES[@]}]: " pick
-    if [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#INST_NAMES[@]} )); then
-      SELECTED_NAME="${INST_NAMES[$((pick-1))]}"
+    read -r -p "Choose instance [1-${#INST_DIRS[@]}]: " pick
+    if [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#INST_DIRS[@]} )); then
+      SELECTED_LABEL="${INST_LABELS[$((pick-1))]}"
       SELECTED_DIR="${INST_DIRS[$((pick-1))]}"
       SELECTED_USER="${INST_USERS[$((pick-1))]}"
+      SELECTED_BASE="${INST_BASES[$((pick-1))]}"
+      SELECTED_SPLIT="${INST_SPLITS[$((pick-1))]}"
       return 0
     fi
     warn "Invalid selection."
@@ -252,8 +287,92 @@ notify_admin(){
   done
 }
 
+stop_instance_services(){
+  local base="$1" split="${2:-0}"
+  if [[ "$split" == "1" ]]; then
+    systemctl stop "${base}-bot" >>"$LOG_FILE" 2>&1 || true
+    systemctl stop "${base}-worker" >>"$LOG_FILE" 2>&1 || true
+  else
+    systemctl stop "$base" >>"$LOG_FILE" 2>&1 || true
+  fi
+}
+
+restart_instance_services(){
+  local base="$1" split="${2:-0}"
+  if [[ "$split" == "1" ]]; then
+    run_cmd "restart bot" systemctl restart "${base}-bot"
+    run_cmd "restart worker" systemctl restart "${base}-worker"
+  else
+    run_cmd "restart service" systemctl restart "$base"
+  fi
+}
+
+create_service_split(){
+  local base="$1" dir="$2" user="$3"
+  local bot="${base}-bot" worker="${base}-worker"
+  if [[ -f "/etc/systemd/system/${base}.service" ]]; then
+    systemctl stop "$base" >>"$LOG_FILE" 2>&1 || true
+    systemctl disable "$base" >>"$LOG_FILE" 2>&1 || true
+    run_cmd "remove combined unit (migrate to split)" rm -f "/etc/systemd/system/${base}.service"
+  fi
+  cat > "/etc/systemd/system/${bot}.service" <<EOF
+[Unit]
+Description=Tele2Rub Telegram bot (telebot.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${user}
+WorkingDirectory=${dir}
+ExecStart=${dir}/venv/bin/python ${dir}/telebot.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  cat > "/etc/systemd/system/${worker}.service" <<EOF
+[Unit]
+Description=Tele2Rub Rubika worker (rub.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${user}
+WorkingDirectory=${dir}
+ExecStart=${dir}/venv/bin/python ${dir}/rub.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  run_cmd "systemd daemon reload" systemctl daemon-reload
+  run_cmd "enable bot" systemctl enable "$bot"
+  run_cmd "enable worker" systemctl enable "$worker"
+  run_cmd "restart bot" systemctl restart "$bot"
+  run_cmd "restart worker" systemctl restart "$worker"
+  run_cmd "service status (bot)" systemctl --no-pager --full status "$bot"
+  run_cmd "service status (worker)" systemctl --no-pager --full status "$worker"
+}
+
 create_service(){
-  local name="$1" dir="$2" user="$3"
+  local name="$1" dir="$2" user="$3" split="${4:-0}"
+  if [[ "$split" == "1" ]]; then
+    create_service_split "$name" "$dir" "$user"
+    return 0
+  fi
+  if [[ -f "/etc/systemd/system/${name}-bot.service" ]] || [[ -f "/etc/systemd/system/${name}-worker.service" ]]; then
+    systemctl stop "${name}-bot" >>"$LOG_FILE" 2>&1 || true
+    systemctl stop "${name}-worker" >>"$LOG_FILE" 2>&1 || true
+    systemctl disable "${name}-bot" >>"$LOG_FILE" 2>&1 || true
+    systemctl disable "${name}-worker" >>"$LOG_FILE" 2>&1 || true
+    run_cmd "remove split units (switch to combined)" rm -f "/etc/systemd/system/${name}-bot.service" "/etc/systemd/system/${name}-worker.service"
+  fi
   cat > "/etc/systemd/system/${name}.service" <<EOF
 [Unit]
 Description=Tele2Rub Bot Service
@@ -279,13 +398,20 @@ EOF
 }
 
 post_deploy_health_check(){
-  local svc="$1" dir="$2"
+  local base="$1" dir="$2" split="${3:-0}"
   info "Running post-deploy health checks..."
-  run_cmd "service is-active check" systemctl is-active --quiet "$svc"
-  run_cmd "service is-enabled check" systemctl is-enabled --quiet "$svc"
+  if [[ "$split" == "1" ]]; then
+    run_cmd "bot is-active" systemctl is-active --quiet "${base}-bot"
+    run_cmd "worker is-active" systemctl is-active --quiet "${base}-worker"
+    run_cmd "bot is-enabled" systemctl is-enabled --quiet "${base}-bot"
+    run_cmd "worker is-enabled" systemctl is-enabled --quiet "${base}-worker"
+  else
+    run_cmd "service is-active check" systemctl is-active --quiet "$base"
+    run_cmd "service is-enabled check" systemctl is-enabled --quiet "$base"
+  fi
   run_cmd "python syntax smoke check" "$dir/venv/bin/python" -m py_compile "$dir/main.py" "$dir/telebot.py" "$dir/rub.py" "$dir/queue_db.py"
-  ok "Health check passed for service=$svc dir=$dir"
-  log_event "OK" "health_check_passed" "service=$svc dir=$dir"
+  ok "Health check passed for systemd_base=$base split=$split dir=$dir"
+  log_event "OK" "health_check_passed" "systemd_base=$base split=$split dir=$dir"
 }
 
 show_requirements_reminder(){
@@ -309,12 +435,16 @@ install_flow(){
   rub_sess="$(ask "Default RUBIKA_SESSION name" "rubika_session")"
   admin_ids="$(ask "ADMIN_IDS (comma-separated)")"
   part_size="$(ask "DEFAULT_PART_SIZE_MB" "1900")"
+  local split_flag=0
+  if ask_yn "Use separate systemd units for Telegram bot and Rubika worker? (${svc}-bot + ${svc}-worker; less RAM per process on small VPS)" "n"; then
+    split_flag=1
+  fi
   install_deps
   clone_or_update_repo "$dir" || return 1
   setup_venv "$dir" || return 1
   write_env "$dir" "$api_id" "$api_hash" "$bot_token" "$rub_sess" "$admin_ids" "$part_size" || return 1
-  create_service "$svc" "$dir" "$user" || return 1
-  post_deploy_health_check "$svc" "$dir" || return 1
+  create_service "$svc" "$dir" "$user" "$split_flag" || return 1
+  post_deploy_health_check "$svc" "$dir" "$split_flag" || return 1
   local ver
   ver="$(read_app_version "$dir/.env")"
   notify_admin "$bot_token" "$admin_ids" "telegramtorubika install successful on $(hostname) version=${ver}"
@@ -323,24 +453,30 @@ install_flow(){
 
 update_flow(){
   ensure_root; os_check
-  local dir svc user bot_token admin_ids
+  local dir svc user bot_token admin_ids split_flag=0
   if select_instance; then
-    dir="$SELECTED_DIR"; svc="$SELECTED_NAME"; user="$SELECTED_USER"
-    info "Selected instance: $svc ($dir)"
+    dir="$SELECTED_DIR"
+    svc="$SELECTED_BASE"
+    user="$SELECTED_USER"
+    split_flag="$SELECTED_SPLIT"
+    info "Selected instance: $SELECTED_LABEL ($dir)"
   else
     dir="$(ask "Install directory" "$DEFAULT_INSTALL_DIR")"
-    svc="$(ask "Systemd service name" "$DEFAULT_SERVICE_NAME")"
+    svc="$(ask "Systemd service name (base name, without -bot/-worker)" "$DEFAULT_SERVICE_NAME")"
     user="$(ask "Run service as user" "root")"
+    if ask_yn "Does this install use split bot+worker systemd units?" "n"; then
+      split_flag=1
+    fi
   fi
   [[ -d "$dir" ]] || { err "Install directory not found: $dir"; return 1; }
   if ask_yn "Create backup before update?" "y"; then backup_flow "$dir"; fi
-  run_cmd "stop service" systemctl stop "$svc" || true
+  stop_instance_services "$svc" "$split_flag"
   install_deps || return 1
   clone_or_update_repo "$dir" || return 1
   setup_venv "$dir" || return 1
   update_build_version_in_env "$dir"
-  create_service "$svc" "$dir" "$user" || return 1
-  post_deploy_health_check "$svc" "$dir" || return 1
+  create_service "$svc" "$dir" "$user" "$split_flag" || return 1
+  post_deploy_health_check "$svc" "$dir" "$split_flag" || return 1
   if [[ -f "$dir/.env" ]]; then
     bot_token="$(grep '^BOT_TOKEN=' "$dir/.env" | sed 's/^BOT_TOKEN=//' || true)"
     admin_ids="$(grep '^ADMIN_IDS=' "$dir/.env" | sed 's/^ADMIN_IDS=//' || true)"
@@ -357,7 +493,7 @@ backup_flow(){
   if [[ -z "$dir" ]]; then
     if select_instance; then
       dir="$SELECTED_DIR"
-      info "Selected instance for backup: $SELECTED_NAME ($dir)"
+      info "Selected instance for backup: $SELECTED_LABEL ($dir)"
     else
       dir="$(ask "Install directory" "$DEFAULT_INSTALL_DIR")"
     fi
@@ -372,55 +508,78 @@ backup_flow(){
 
 restore_flow(){
   ensure_root
-  local dir svc archive
+  local dir base archive split_flag=0
   if select_instance; then
-    dir="$SELECTED_DIR"; svc="$SELECTED_NAME"
-    info "Selected instance for restore: $svc ($dir)"
+    dir="$SELECTED_DIR"
+    base="$SELECTED_BASE"
+    split_flag="$SELECTED_SPLIT"
+    info "Selected instance for restore: $SELECTED_LABEL ($dir)"
   else
     dir="$(ask "Install directory" "$DEFAULT_INSTALL_DIR")"
-    svc="$(ask "Systemd service name" "$DEFAULT_SERVICE_NAME")"
+    base="$(ask "Systemd service name (base name)" "$DEFAULT_SERVICE_NAME")"
+    [[ -f "/etc/systemd/system/${base}-bot.service" ]] && split_flag=1
   fi
   archive="$(ask "Backup file (.tar.gz) path")"
   [[ -f "$archive" ]] || { err "Backup not found: $archive"; return 1; }
   ask_yn "This will overwrite files in $dir. Continue?" "n" || return 0
-  run_cmd "stop service" systemctl stop "$svc" || true
+  stop_instance_services "$base" "$split_flag"
   run_cmd "create install directory" mkdir -p "$dir"
   run_cmd "restore archive" tar -xzf "$archive" -C "$dir"
-  run_cmd "restart service" systemctl restart "$svc" || true
-  run_cmd "service status" systemctl --no-pager --full status "$svc" || true
+  restart_instance_services "$base" "$split_flag"
+  if [[ "$split_flag" == "1" ]]; then
+    run_cmd "service status (bot)" systemctl --no-pager --full status "${base}-bot" || true
+    run_cmd "service status (worker)" systemctl --no-pager --full status "${base}-worker" || true
+  else
+    run_cmd "service status" systemctl --no-pager --full status "$base" || true
+  fi
   ok "Restore completed."
 }
 
 uninstall_flow(){
   ensure_root
-  local dir svc
+  local dir base split_flag=0
   if select_instance; then
-    dir="$SELECTED_DIR"; svc="$SELECTED_NAME"
-    info "Selected instance for uninstall: $svc ($dir)"
+    dir="$SELECTED_DIR"
+    base="$SELECTED_BASE"
+    split_flag="$SELECTED_SPLIT"
+    info "Selected instance for uninstall: $SELECTED_LABEL ($dir)"
   else
     dir="$(ask "Install directory" "$DEFAULT_INSTALL_DIR")"
-    svc="$(ask "Systemd service name" "$DEFAULT_SERVICE_NAME")"
+    base="$(ask "Systemd service name (base name)" "$DEFAULT_SERVICE_NAME")"
+    [[ -f "/etc/systemd/system/${base}-bot.service" ]] && split_flag=1
   fi
   ask_yn "Uninstall service and delete $dir ?" "n" || return 0
-  run_cmd "stop service" systemctl stop "$svc" || true
-  run_cmd "disable service" systemctl disable "$svc" || true
-  run_cmd "remove service file" rm -f "/etc/systemd/system/${svc}.service"
+  stop_instance_services "$base" "$split_flag"
+  if [[ "$split_flag" == "1" ]]; then
+    run_cmd "disable bot" systemctl disable "${base}-bot" || true
+    run_cmd "disable worker" systemctl disable "${base}-worker" || true
+    run_cmd "remove split unit files" rm -f "/etc/systemd/system/${base}-bot.service" "/etc/systemd/system/${base}-worker.service"
+  else
+    run_cmd "disable service" systemctl disable "$base" || true
+    run_cmd "remove service file" rm -f "/etc/systemd/system/${base}.service"
+  fi
   run_cmd "systemd daemon reload" systemctl daemon-reload
   [[ -d "$dir" ]] && run_cmd "remove install directory" rm -rf "$dir" || warn "Install directory does not exist."
   ok "Uninstall completed."
 }
 
 logs_flow(){
-  local svc
+  local base split_flag=0
   if select_instance; then
-    svc="$SELECTED_NAME"
-    info "Selected instance for logs: $svc"
+    base="$SELECTED_BASE"
+    split_flag="$SELECTED_SPLIT"
+    info "Selected instance for logs: $SELECTED_LABEL"
   else
-    svc="$(ask "Systemd service name" "$DEFAULT_SERVICE_NAME")"
+    base="$(ask "Systemd service name (base name)" "$DEFAULT_SERVICE_NAME")"
+    [[ -f "/etc/systemd/system/${base}-bot.service" ]] && split_flag=1
   fi
   info "Installer logs: $LOG_FILE"
   info "Installer JSON logs: $LOG_JSON_FILE"
-  journalctl -u "$svc" -f -n 120
+  if [[ "$split_flag" == "1" ]]; then
+    journalctl -u "${base}-bot" -u "${base}-worker" -f -n 120
+  else
+    journalctl -u "$base" -f -n 120
+  fi
 }
 
 installer_logs_flow(){
@@ -437,7 +596,7 @@ bot_logs_flow(){
   local dir
   if select_instance; then
     dir="$SELECTED_DIR"
-    info "Selected instance for bot logs: $SELECTED_NAME ($dir)"
+    info "Selected instance for bot logs: $SELECTED_LABEL ($dir)"
   else
     dir="$(ask "Install directory" "$DEFAULT_INSTALL_DIR")"
   fi
@@ -449,7 +608,7 @@ worker_logs_flow(){
   local dir
   if select_instance; then
     dir="$SELECTED_DIR"
-    info "Selected instance for worker logs: $SELECTED_NAME ($dir)"
+    info "Selected instance for worker logs: $SELECTED_LABEL ($dir)"
   else
     dir="$(ask "Install directory" "$DEFAULT_INSTALL_DIR")"
   fi
@@ -458,21 +617,29 @@ worker_logs_flow(){
 }
 
 all_logs_flow(){
-  local svc dir out
+  # Avoid exiting entire script on missing files / journal quirks (set -e at top of installer)
+  set +e
+  local base dir out split_flag=0
   if select_instance; then
-    svc="$SELECTED_NAME"
+    base="$SELECTED_BASE"
+    split_flag="$SELECTED_SPLIT"
     dir="$SELECTED_DIR"
-    info "Selected instance for all logs: $svc ($dir)"
+    info "Selected instance for all logs: $SELECTED_LABEL ($dir)"
   else
     dir="$(ask "Install directory" "$DEFAULT_INSTALL_DIR")"
-    svc="$(ask "Systemd service name" "$DEFAULT_SERVICE_NAME")"
+    base="$(ask "Systemd service name (base name)" "$DEFAULT_SERVICE_NAME")"
+    [[ -f "/etc/systemd/system/${base}-bot.service" ]] && split_flag=1
   fi
+
+  [[ -z "${base:-}" ]] && base="$DEFAULT_SERVICE_NAME"
+  [[ -z "${dir:-}" ]] && dir="$DEFAULT_INSTALL_DIR"
 
   out="/tmp/tele2rub-all-logs-$(date +%Y%m%d-%H%M%S).txt"
   {
     echo "===== TELE2RUB ALL LOGS ====="
     echo "generated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    echo "service=$svc"
+    echo "systemd_base=$base"
+    echo "split=$split_flag"
     echo "install_dir=$dir"
     echo
 
@@ -485,7 +652,11 @@ all_logs_flow(){
     echo
 
     echo "===== SERVICE JOURNAL (tail -n 300) ====="
-    journalctl -u "$svc" -n 300 --no-pager 2>/dev/null || echo "(journal unavailable for $svc)"
+    if [[ "$split_flag" == "1" ]]; then
+      journalctl -u "${base}-bot" -u "${base}-worker" -n 300 --no-pager 2>/dev/null || echo "(journal unavailable for ${base}-bot / ${base}-worker)"
+    else
+      journalctl -u "$base" -n 300 --no-pager 2>/dev/null || echo "(journal unavailable for $base)"
+    fi
     echo
 
     echo "===== BOT EVENTS (tail -n 300) ====="
@@ -496,10 +667,13 @@ all_logs_flow(){
     tail -n 300 "$dir/queue/worker_events.jsonl" 2>/dev/null || echo "(missing) $dir/queue/worker_events.jsonl"
     echo
   } > "$out"
+  local rc=$?
+  set -e
 
   ok "All logs exported: $out"
   echo
   cat "$out"
+  return "$rc"
 }
 
 menu(){
@@ -563,5 +737,9 @@ run_quick_flag(){
   esac
 }
 
-run_quick_flag "${1:-}"
-menu
+# Flag mode: never fall through to interactive menu (avoids confusing UX after --all-logs etc.)
+if [[ -n "${1:-}" ]]; then
+  run_quick_flag "${1}"
+else
+  menu
+fi

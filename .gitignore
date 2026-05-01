@@ -1,0 +1,20 @@
+# Local debug exports (do not commit)
+log.txt
+*.log
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+venv/
+.venv/
+
+# Runtime / optional local data (often preserved on server only)
+# queue/
+# downloads/

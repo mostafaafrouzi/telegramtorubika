@@ -93,6 +93,24 @@ pip install -r requirements.txt
 python main.py
 ```
 
+### Split bot and worker (optional, less RAM per process)
+
+By default `main.py` runs **both** `telebot.py` and `rub.py` in one parent process (two children). On small VPS instances, large Telegram downloads can compete with the Rubika worker and trigger OOM. You can run them as **two systemd services** instead (same repo dir and `.env`):
+
+- **Installer:** during **Install**, answer *yes* when asked for separate units — or copy the examples below manually.
+- Example units: `deploy/systemd/tele2rub-bot.service.example` and `deploy/systemd/tele2rub-worker.service.example`
+- Use either **one** combined `main.py` service **or** the `*-bot` + `*-worker` pair for the same install dir — not both.
+
+Live logs on a split install:
+
+```bash
+journalctl -u tele2rub-bot -u tele2rub-worker -f -n 120
+```
+
+### Upload size cap (`MAX_FILE_MB`)
+
+Set `MAX_FILE_MB` in `.env` to reject files (and batch ZIPs) over that size in megabytes before queueing. Use `0` or leave empty for no limit. Shown on `/admin`.
+
 ## Bot usage basics
 
 1. `/start`
@@ -117,10 +135,11 @@ python main.py
 
 ## Troubleshooting
 
-- Service logs:
+- Service logs (combined `main.py` unit):
   ```bash
   journalctl -u tele2rub -f -n 120
   ```
+  If you use split bot/worker units instead, follow both: `journalctl -u tele2rub-bot -u tele2rub-worker -f -n 120`.
 - Installer logs:
   ```bash
   tail -n 200 /tmp/tele2rub-installer.log
@@ -172,6 +191,25 @@ python main.py
   sudo bash installer.sh --worker-logs
   sudo bash installer.sh --all-logs
   ```
+
+Export **all** logs to `/tmp/tele2rub-all-logs-*.txt` (service journal + bot/worker JSONL + installer logs). Requires `bash` (not plain `sh`). Only the **first** CLI argument is used as the mode flag.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mostafaafrouzi/telegramtorubika/main/installer.sh -o /tmp/tele2rub-installer.sh
+sudo bash /tmp/tele2rub-installer.sh --all-logs
+```
+
+### Large ZIP / heavy uploads (why Rubika may “do nothing”)
+
+Typical causes seen in production logs:
+
+| Symptom | Likely cause | Mitigation |
+|--------|----------------|------------|
+| `502` / `Bad Gateway` on `*.iranlms.ir` | Rubika edge/API instability or routing | Retry later; try another egress/VPS region |
+| `Error uploading chunk` | Unstable upload session to Rubika | Already retried in worker; check network |
+| `tele2rub.service: ... killed by the OOM killer` during Telegram upload | **Low RAM** while Pyrogram uploads large files (`SaveBigFilePart`) | Add **swap**, increase VPS RAM, avoid multi‑GB single uploads off tiny instances, or split archives |
+
+Admin helpers on the bot (see `/admin`): disk summary is shown there; `/cleanup_downloads` removes files under `downloads/` (admin only).
 
 ### Log interpretation checklist
 

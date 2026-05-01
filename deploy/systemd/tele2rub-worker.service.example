@@ -1,0 +1,23 @@
+# Example: Rubika worker only (split from bot).
+# Copy to /etc/systemd/system/tele2rub-worker.service, adjust paths, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now tele2rub-worker.service
+#
+# Run alongside tele2rub-bot.service (same WorkingDirectory and .env as the bot).
+
+[Unit]
+Description=telegramtorubika Rubika worker (rub.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/tele2rub
+EnvironmentFile=-/opt/tele2rub/.env
+ExecStart=/opt/tele2rub/venv/bin/python /opt/tele2rub/rub.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
