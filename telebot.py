@@ -162,10 +162,16 @@ I18N = {
         ),
         "menu_intro": (
             "منوی اصلی:\n"
+            "- ردیف «پلن»: دستورهای `/plan` · `/usage` · `/queue` · `/purchase` روی کیبورد\n"
+            "- «پلن و خرید»: همان گزینه‌ها در یک زیرمنو\n"
             "- منوی اتصال: مدیریت اتصال روبیکا\n"
             "- منوی فایل‌ها: فایل ZIP، ارسال متن/لینک، مدیریت صف\n"
             "- منوی تنظیمات: حالت مستقیم\n"
             "- راهنما: نمایش دستورهای اصلی"
+        ),
+        "plan_menu_opened": (
+            "منوی پلن و محدودیت:\n"
+            "از دکمه‌های پایین همان `/plan`، `/usage`، `/queue` و `/purchase` را می‌فرستد."
         ),
         "pick_lang": "زبان را انتخاب کن:",
         "lang_saved": "زبان ذخیره شد.",
@@ -183,6 +189,7 @@ I18N = {
         "btn_main_help": "راهنما",
         "btn_main_net": "وضعیت شبکه",
         "btn_main_queue": "مدیریت صف",
+        "btn_main_plan_section": "📋 پلن / خرید / محدودیت",
         "btn_main_admin": "منوی ادمین",
         "btn_back_main": "بازگشت به منوی اصلی",
         "btn_rub_connect": "اتصال روبیکا",
@@ -242,7 +249,7 @@ I18N = {
             "- پنل ادمین: `/admin`\n"
             "- حذف یک job: `/del <job_id>`\n\n"
             "برای راهنمای تحلیل لاگ: `/loghelp`\n"
-            "• مصرف و سهمیه: `/usage` — پلن و خرید: `/plan`"
+            "• مصرف و سهمیه: `/usage` — پلن و خرید: `/plan` — راهنمای خرید: `/purchase`"
         ),
         "loghelp_body": (
             "راهنمای تحلیل لاگ job:\n\n"
@@ -435,10 +442,16 @@ I18N = {
         ),
         "menu_intro": (
             "Main menu:\n"
+            "- Plan row: `/plan` · `/usage` · `/queue` · `/purchase` on the keyboard\n"
+            "- «Plan / billing»: same shortcuts grouped\n"
             "- Connection: Rubika link\n"
             "- Files: ZIP batch, text/link, queue\n"
             "- Settings: direct mode\n"
             "- Help: commands"
+        ),
+        "plan_menu_opened": (
+            "Plan & limits menu:\n"
+            "The buttons below send `/plan`, `/usage`, `/queue`, and `/purchase`."
         ),
         "pick_lang": "Choose language:",
         "lang_saved": "Language saved.",
@@ -456,6 +469,7 @@ I18N = {
         "btn_main_help": "Help",
         "btn_main_net": "Network status",
         "btn_main_queue": "Queue",
+        "btn_main_plan_section": "📋 Plan / billing / limits",
         "btn_main_admin": "Admin menu",
         "btn_back_main": "Main menu",
         "btn_rub_connect": "Connect Rubika",
@@ -515,7 +529,7 @@ I18N = {
             "- Admin: `/admin`\n"
             "- Remove one job: `/del <job_id>`\n\n"
             "Log analysis: `/loghelp`\n"
-            "Usage & limits: `/usage` — plan / purchase info: `/plan`"
+            "Usage & limits: `/usage` — plan bundle: `/plan` — purchase info: `/purchase`"
         ),
         "loghelp_body": (
             "Job log analysis:\n\n"
@@ -843,6 +857,15 @@ def recent_failed_detail_text(session: Optional[str], limit: int = 8) -> str:
 def build_main_menu(user_id: int) -> ReplyKeyboardMarkup:
     rows = [
         [
+            KeyboardButton("/plan"),
+            KeyboardButton("/usage"),
+        ],
+        [
+            KeyboardButton("/queue"),
+            KeyboardButton("/purchase"),
+        ],
+        [KeyboardButton(tr(user_id, "btn_main_plan_section"))],
+        [
             KeyboardButton(tr(user_id, "btn_main_connection")),
             KeyboardButton(tr(user_id, "btn_main_files")),
         ],
@@ -858,6 +881,25 @@ def build_main_menu(user_id: int) -> ReplyKeyboardMarkup:
     if user_id in ADMIN_IDS:
         rows.append([KeyboardButton(tr(user_id, "btn_main_admin"))])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=False)
+
+
+def build_plan_menu(user_id: int) -> ReplyKeyboardMarkup:
+    """Reply keyboard: plan / usage / queue / purchase (same as typing commands)."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton("/plan"),
+                KeyboardButton("/usage"),
+            ],
+            [
+                KeyboardButton("/queue"),
+                KeyboardButton("/purchase"),
+            ],
+            [KeyboardButton(tr(user_id, "btn_back_main"))],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
 
 
 def build_rubika_menu(user_id: int) -> ReplyKeyboardMarkup:
@@ -878,14 +920,19 @@ def build_files_menu(user_id: int) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [
+                KeyboardButton("/plan"),
+                KeyboardButton("/usage"),
+            ],
+            [
+                KeyboardButton("/queue"),
+                KeyboardButton("/purchase"),
+            ],
+            [KeyboardButton(tr(user_id, "btn_main_plan_section"))],
+            [
                 KeyboardButton(tr(user_id, "btn_zip_start")),
                 KeyboardButton(tr(user_id, "btn_zip_end")),
             ],
             [KeyboardButton(tr(user_id, "btn_send_content"))],
-            [
-                KeyboardButton("/plan"),
-                KeyboardButton("/usage"),
-            ],
             [
                 KeyboardButton(tr(user_id, "btn_queue")),
                 KeyboardButton(tr(user_id, "btn_clear_all")),
@@ -914,6 +961,11 @@ def build_settings_menu(user_id: int) -> ReplyKeyboardMarkup:
 def build_admin_menu(user_id: int) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
+            [
+                KeyboardButton("/plan"),
+                KeyboardButton("/usage"),
+                KeyboardButton("/admin"),
+            ],
             [KeyboardButton(tr(user_id, "btn_admin_panel")), KeyboardButton("/version")],
             [KeyboardButton(tr(user_id, "btn_back_main"))],
         ],
@@ -1807,6 +1859,12 @@ async def plan_handler(client: Client, message: Message):
     await message.reply_text(body, parse_mode=None)
 
 
+@app.on_message(filters.private & filters.command("purchase"))
+async def purchase_handler(client: Client, message: Message):
+    uid = message.from_user.id
+    await message.reply_text(tr(uid, "purchase_info_body"), parse_mode=None)
+
+
 @app.on_message(filters.private & filters.command("admin_tier"))
 async def admin_tier_handler(client: Client, message: Message):
     uid = message.from_user.id
@@ -2245,13 +2303,20 @@ async def delete_one_handler(client: Client, message: Message):
         return
 
 
-@app.on_message(filters.private & filters.text & ~filters.command(["start", "menu", "lang", "help", "loghelp", "version", "rubika_status", "rubika_connect", "directmode", "netstatus", "admin", "safemode", "del", "delall", "newbatch", "done", "sendtext", "sendlink", "queue", "usage", "plan", "admin_tier", "admin_bonus"]))
+@app.on_message(filters.private & filters.text & ~filters.command(["start", "menu", "lang", "help", "loghelp", "version", "rubika_status", "rubika_connect", "directmode", "netstatus", "admin", "safemode", "del", "delall", "newbatch", "done", "sendtext", "sendlink", "queue", "usage", "plan", "purchase", "admin_tier", "admin_bonus"]))
 async def text_handler(client: Client, message: Message):
     global waiting_for_zip_password
 
     text = message.text or ""
     user_id = message.from_user.id
     state = get_state(user_id)
+
+    if text.strip() == tr(user_id, "btn_main_plan_section"):
+        await message.reply_text(
+            tr(user_id, "plan_menu_opened"),
+            reply_markup=build_plan_menu(user_id),
+        )
+        return
 
     button_map = {
         "menu": "/menu",
