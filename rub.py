@@ -41,7 +41,8 @@ NETWORK_FILE = QUEUE_DIR / "network.json"
 WORKER_LOG_FILE = QUEUE_DIR / "worker_events.jsonl"
 
 MAX_RETRIES = 5
-UPLOAD_TIMEOUT = 1800
+# Total wall-clock budget for one task upload (all parts / retries). Large ZIPs need hours on slow links.
+UPLOAD_TIMEOUT = int(os.getenv("UPLOAD_TIMEOUT_SECONDS", str(6 * 3600)))
 TARGET = "me"
 DEFAULT_PART_SIZE_MB = int(os.getenv("DEFAULT_PART_SIZE_MB", "1900"))
 SAFE_REQUIRED_EXTS = {
@@ -86,16 +87,18 @@ def pretty_size(size) -> str:
     return f"{size:.2f} {units[index]}"
 
 def get_per_attempt_timeout(file_path: str) -> int:
+    """Single-attempt timeout for send_with_timeout. Must allow multi‑GB uploads on slow VPS."""
     size_mb = Path(file_path).stat().st_size / (1024 * 1024)
 
-    if size_mb < 100:
-        return 180
-    elif size_mb < 500:
-        return 420
-    elif size_mb < 1000:
-        return 720
-    else:
-        return 1200
+    if size_mb < 50:
+        return 600
+    if size_mb < 200:
+        return 1800
+    if size_mb < 800:
+        return 3600
+    if size_mb < 2000:
+        return 7200
+    return min(14400, max(3600, int(size_mb * 4)))  # ~4s per MB, cap 4h
     
 def eta_text(seconds) -> str:
     if not seconds or seconds <= 0:
@@ -220,7 +223,10 @@ def send_with_timeout(file_path, caption, timeout, session_name: Optional[str] =
     t.join(timeout)
 
     if t.is_alive():
-        raise RuntimeError("آپلود بیشتر از حد مجاز طول کشید و لغو شد.")
+        raise RuntimeError(
+            f"تک‌تلاش آپلود بیش از {timeout}s طول کشید (فایل خیلی بزرگ یا شبکه کند). "
+            "دوباره تلاش می‌شود یا سقف زمانی را با UPLOAD_TIMEOUT_SECONDS بالا ببر."
+        )
 
     if "err" in error:
         raise error["err"]
@@ -234,7 +240,9 @@ def send_with_retry(file_path: str, caption: str = "", task: dict | None = None,
     for attempt in range(1, MAX_RETRIES + 1):
 
         if time.time() - start_time > UPLOAD_TIMEOUT:
-            raise RuntimeError("آپلود بیشتر از حد مجاز طول کشید و لغو شد.")
+            raise RuntimeError(
+                f"کل زمان آپلود از سقف {UPLOAD_TIMEOUT}s گذشت. برای ZIPهای چندگیگابایتی UPLOAD_TIMEOUT_SECONDS را در .env بالا ببر."
+            )
 
         if task and is_cancelled(task):
             raise RuntimeError("ارسال لغو شد.")
@@ -254,29 +262,67 @@ def send_with_retry(file_path: str, caption: str = "", task: dict | None = None,
             remaining = UPLOAD_TIMEOUT - elapsed
 
             if remaining <= 0:
-                raise RuntimeError("آپلود بیشتر از ۳۰ دقیقه طول کشید و لغو شد.")
+                raise RuntimeError(
+                    f"آپلود از سقف کل زمان مجاز ({UPLOAD_TIMEOUT}s) گذشت."
+                )
 
             per_attempt = min(get_per_attempt_timeout(file_path), remaining)
 
             if ENABLE_UPLOAD_CHECKSUM and task:
                 try:
-                    h = hashlib.md5()
-                    with open(file_path, "rb") as bf:
-                        for chunk in iter(lambda: bf.read(1024 * 1024), b""):
-                            h.update(chunk)
-                    worker_log(
-                        "phase",
-                        chat_id=task.get("chat_id"),
-                        job_id=task.get("job_id"),
-                        phase="upload_checksum",
-                        md5_hex=h.hexdigest(),
-                        file=os.path.basename(file_path),
-                        attempt=attempt,
-                    )
+                    fp_sz = Path(file_path).stat().st_size
+                    if fp_sz > 64 * 1024 * 1024:
+                        worker_log(
+                            "phase",
+                            chat_id=task.get("chat_id"),
+                            job_id=task.get("job_id"),
+                            phase="upload_checksum_skipped_large",
+                            file=os.path.basename(file_path),
+                            bytes=fp_sz,
+                            attempt=attempt,
+                        )
+                    else:
+                        h = hashlib.md5()
+                        with open(file_path, "rb") as bf:
+                            for chunk in iter(lambda: bf.read(1024 * 1024), b""):
+                                h.update(chunk)
+                        worker_log(
+                            "phase",
+                            chat_id=task.get("chat_id"),
+                            job_id=task.get("job_id"),
+                            phase="upload_checksum",
+                            md5_hex=h.hexdigest(),
+                            file=os.path.basename(file_path),
+                            attempt=attempt,
+                        )
                 except Exception:
                     pass
 
-            return send_with_timeout(file_path, caption, per_attempt, session_name=session_name)
+            stop_hb = threading.Event()
+
+            def _upload_heartbeat():
+                while not stop_hb.wait(90):
+                    if task and not is_cancelled(task):
+                        elapsed_m = int(time.time() - start_time) // 60
+                        try:
+                            push_status(
+                                task,
+                                f"🔼 آپلود روبیکا در حال انجام...\n"
+                                f"⏱ حدود `{elapsed_m}` دقیقه از شروع این کار\n"
+                                f"تلاش `{attempt}/{MAX_RETRIES}` — `/del {task.get('job_id')}`",
+                                "uploading",
+                            )
+                        except Exception:
+                            pass
+
+            hb_thread = threading.Thread(target=_upload_heartbeat, daemon=True)
+            hb_thread.start()
+            try:
+                return send_with_timeout(
+                    file_path, caption, per_attempt, session_name=session_name
+                )
+            finally:
+                stop_hb.set()
 
         except Exception as e:
             last_error = e

@@ -57,6 +57,7 @@ BOT_LOG_FILE = QUEUE_DIR / "bot_events.jsonl"
 WORKER_EVENTS_FILE = QUEUE_DIR / "worker_events.jsonl"
 KNOWN_CHATS_FILE = QUEUE_DIR / "known_chats.json"
 BROADCAST_STATE_FILE = QUEUE_DIR / "broadcast_state.json"
+PROCESSING_FILE = QUEUE_DIR / "processing.json"
 DISABLE_UPDATE_BROADCAST = os.getenv("DISABLE_UPDATE_BROADCAST", "").strip().lower() in (
     "1",
     "true",
@@ -213,12 +214,16 @@ I18N = {
         "prompt_sendlink": "لینک را ارسال کن.",
         "queue_panel": (
             "مدیریت صف:\n\n"
-            "- در انتظار ارسال: `{pending}`\n"
+            "- در انتظار در صف SQLite: `{pending}`\n"
+            "- هم‌اکنون در حال پردازش (worker): `{processing}`\n"
             "- کل خطاها (global): `{failed}`\n"
             "- حذف‌شده‌ها: `{deleted}`\n"
             "- لغوشده‌ها: `{cancelled}`\n\n"
+            "اگر آپلود گیر کرد ولی اینجا `۰` بود، یعنی کار از صف بیرون آمده و worker مشغول است.\n\n"
             "برای پاکسازی صف از دکمهٔ «پاکسازی صف من» استفاده کن."
         ),
+        "queue_processing_none": "`—`",
+        "queue_processing_detail": "`{job_id}` نوع `{task_type}` — `{file}` (~{size})",
         "help_short": (
             "راهنمای سریع:\n\n"
             "منوی اتصال:\n"
@@ -237,7 +242,7 @@ I18N = {
             "- پنل ادمین: `/admin`\n"
             "- حذف یک job: `/del <job_id>`\n\n"
             "برای راهنمای تحلیل لاگ: `/loghelp`\n"
-            "• مصرف و سهمیه: `/usage`"
+            "• مصرف و سهمیه: `/usage` — پلن و خرید: `/plan`"
         ),
         "loghelp_body": (
             "راهنمای تحلیل لاگ job:\n\n"
@@ -405,6 +410,18 @@ I18N = {
         "usage_disabled_hint": "سهمیه‌گذاری با `DISABLE_USAGE_LIMITS` خاموش است (فقط محدودیت env در صورت تنظیم).",
         "batch_raw_hint": "جمع حجم خام فعلی: ~`{raw_mb}` MB ({n} فایل). بعد از ZIP ممکن است کمی فرق کند.",
         "direct_url_use_sendlink": "برای لینک از دکمه یا دستور `/sendlink` استفاده کن.",
+        "purchase_info_body": (
+            "💳 خرید / ارتقای پلن\n\n"
+            "درگاه پرداخت خودکار هنوز وصل نیست. فعلاً:\n"
+            "• از ادمین بخواه پلن را با `/admin_tier` یا `/admin_bonus` برایت تنظیم کند؛ یا\n"
+            "• اسکریپت `tools/grant_plan.py` روی سرور؛ یا\n"
+            "• `tools/payment_webhook_stub.py` با کلید `PAYMENT_WEBHOOK_SECRET`.\n\n"
+            "بعد از پرداخت واقعی، درگاه را به همین webhook وصل کن."
+        ),
+        "rubika_update_hint": (
+            "اگر بعد از به‌روزرسانی سرور روبیکا «قطع» شد: یک‌بار `/rubika_connect` بزن. "
+            "فایل‌های session از rsync پاک نمی‌شوند؛ خطای 502 از سرورهای روبیکا هم رایج است."
+        ),
     },
     "en": {
         "welcome": (
@@ -470,12 +487,16 @@ I18N = {
         "prompt_sendlink": "Send the link.",
         "queue_panel": (
             "Queue:\n\n"
-            "- Pending (your session): `{pending}`\n"
+            "- Pending in SQLite (your session): `{pending}`\n"
+            "- Currently processing (worker): `{processing}`\n"
             "- Failed (global): `{failed}`\n"
             "- Deleted: `{deleted}`\n"
             "- Cancelled: `{cancelled}`\n\n"
+            "If upload looks stuck but Pending is `0`, the job left the queue and the worker is busy.\n\n"
             "Use «Clear my queue» to wipe your pending tasks."
         ),
+        "queue_processing_none": "`—`",
+        "queue_processing_detail": "`{job_id}` type `{task_type}` — `{file}` (~{size})",
         "help_short": (
             "Quick help:\n\n"
             "Connection:\n"
@@ -494,7 +515,7 @@ I18N = {
             "- Admin: `/admin`\n"
             "- Remove one job: `/del <job_id>`\n\n"
             "Log analysis: `/loghelp`\n"
-            "Usage & limits: `/usage`"
+            "Usage & limits: `/usage` — plan / purchase info: `/plan`"
         ),
         "loghelp_body": (
             "Job log analysis:\n\n"
@@ -662,6 +683,18 @@ I18N = {
         "usage_disabled_hint": "Quotas are off (`DISABLE_USAGE_LIMITS`). Only optional env caps apply.",
         "batch_raw_hint": "Current raw total ~`{raw_mb}` MB ({n} files). ZIP size may differ slightly.",
         "direct_url_use_sendlink": "For links use the button or `/sendlink`.",
+        "purchase_info_body": (
+            "💳 Plans / purchase\n\n"
+            "Automatic checkout is not wired yet. For now:\n"
+            "• Ask an admin to run `/admin_tier` or `/admin_bonus`; or\n"
+            "• Use `tools/grant_plan.py` on the server; or\n"
+            "• `tools/payment_webhook_stub.py` + `PAYMENT_WEBHOOK_SECRET`.\n\n"
+            "Connect your real PSP to that webhook when ready."
+        ),
+        "rubika_update_hint": (
+            "If Rubika breaks after a server update: run `/rubika_connect` once. "
+            "Session files are excluded from rsync; 502s from Rubika edges are common."
+        ),
     },
 }
 
@@ -849,6 +882,10 @@ def build_files_menu(user_id: int) -> ReplyKeyboardMarkup:
                 KeyboardButton(tr(user_id, "btn_zip_end")),
             ],
             [KeyboardButton(tr(user_id, "btn_send_content"))],
+            [
+                KeyboardButton("/plan"),
+                KeyboardButton("/usage"),
+            ],
             [
                 KeyboardButton(tr(user_id, "btn_queue")),
                 KeyboardButton(tr(user_id, "btn_clear_all")),
@@ -1323,6 +1360,36 @@ def pretty_size(size) -> str:
     return f"{size:.2f} {units[index]}"
 
 
+def processing_display_for_queue(user_id: int) -> str:
+    """Current worker job for this user's Rubika session (reads queue/processing.json)."""
+    if not PROCESSING_FILE.exists():
+        return tr(user_id, "queue_processing_none")
+    try:
+        data = json.loads(PROCESSING_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return tr(user_id, "queue_processing_none")
+    session = get_user_session(user_id)
+    if not session or data.get("rubika_session") != session:
+        return tr(user_id, "queue_processing_none")
+    jid = str(data.get("job_id", "?"))
+    typ = str(data.get("type", "?"))
+    fn = ""
+    if data.get("file_name"):
+        fn = str(data["file_name"])
+    elif data.get("path"):
+        fn = Path(str(data["path"])).name
+    sz = data.get("file_size")
+    sz_txt = pretty_size(sz) if sz else "?"
+    return tr(
+        user_id,
+        "queue_processing_detail",
+        job_id=jid,
+        task_type=typ,
+        file=fn or "—",
+        size=sz_txt,
+    )
+
+
 def eta_text(seconds, user_id: int = 0) -> str:
     if not seconds or seconds <= 0:
         return tr(user_id, "eta_unknown") if user_id else "نامشخص"
@@ -1720,6 +1787,8 @@ async def admin_handler(client: Client, message: Message):
         + "\n"
         + tr(uid, "admin_plan_note")
         + "\n\n"
+        + tr(uid, "rubika_update_hint")
+        + "\n\n"
         + admin_disk_report_text(),
         reply_markup=build_admin_menu(uid),
         parse_mode=None,
@@ -1729,6 +1798,13 @@ async def admin_handler(client: Client, message: Message):
 @app.on_message(filters.private & filters.command("usage"))
 async def usage_handler(client: Client, message: Message):
     await message.reply_text(usage_report_text(message.from_user.id), parse_mode=None)
+
+
+@app.on_message(filters.private & filters.command("plan"))
+async def plan_handler(client: Client, message: Message):
+    uid = message.from_user.id
+    body = usage_report_text(uid) + "\n\n" + tr(uid, "purchase_info_body")
+    await message.reply_text(body, parse_mode=None)
 
 
 @app.on_message(filters.private & filters.command("admin_tier"))
@@ -2063,10 +2139,12 @@ async def queue_manage_handler(
     user_id = target_user_id if target_user_id is not None else message.from_user.id
     session = get_user_session(user_id)
     pending = queue.queue_count_by_session(session or "")
+    proc = processing_display_for_queue(user_id)
     summary = tr(
         user_id,
         "queue_panel",
         pending=pending,
+        processing=proc,
         failed=failed_count(),
         deleted=queue.deleted_count(),
         cancelled=queue.cancelled_count(),
@@ -2167,7 +2245,7 @@ async def delete_one_handler(client: Client, message: Message):
         return
 
 
-@app.on_message(filters.private & filters.text & ~filters.command(["start", "menu", "lang", "help", "loghelp", "version", "rubika_status", "rubika_connect", "directmode", "netstatus", "admin", "safemode", "del", "delall", "newbatch", "done", "sendtext", "sendlink", "queue", "usage", "admin_tier", "admin_bonus"]))
+@app.on_message(filters.private & filters.text & ~filters.command(["start", "menu", "lang", "help", "loghelp", "version", "rubika_status", "rubika_connect", "directmode", "netstatus", "admin", "safemode", "del", "delall", "newbatch", "done", "sendtext", "sendlink", "queue", "usage", "plan", "admin_tier", "admin_bonus"]))
 async def text_handler(client: Client, message: Message):
     global waiting_for_zip_password
 
