@@ -24,6 +24,12 @@ class QueueDB:
         conn.row_factory = sqlite3.Row
         return conn
 
+    def _migrate_tasks_table(self, conn):
+        rows = conn.execute("PRAGMA table_info(tasks)").fetchall()
+        cols = {r[1] for r in rows}
+        if "telegram_user_id" not in cols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN telegram_user_id INTEGER")
+
     def _init_db(self):
         with self._connect() as conn:
             conn.execute(
@@ -38,6 +44,7 @@ class QueueDB:
                 )
                 """
             )
+            self._migrate_tasks_table(conn)
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS deleted_jobs (
@@ -69,11 +76,14 @@ class QueueDB:
             task = dict(task)
             task.setdefault("job_id", str(int(time.time() * 1000)))
             created_at = int(time.time())
+            uid = task.get("telegram_user_id")
+            if uid is not None:
+                uid = int(uid)
             with self._connect() as conn:
                 conn.execute(
                     """
-                    INSERT INTO tasks (job_id, payload, status_message_id, rubika_session, created_at)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO tasks (job_id, payload, status_message_id, rubika_session, created_at, telegram_user_id)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
                         str(task["job_id"]),
@@ -81,6 +91,7 @@ class QueueDB:
                         int(task.get("status_message_id") or 0),
                         task.get("rubika_session"),
                         created_at,
+                        uid,
                     ),
                 )
                 conn.commit()
@@ -186,6 +197,15 @@ class QueueDB:
             row = conn.execute(
                 "SELECT COUNT(1) AS c FROM tasks WHERE rubika_session = ?",
                 (rubika_session,),
+            ).fetchone()
+            return int(row["c"] if row else 0)
+
+    def count_tasks_for_user(self, telegram_user_id: int) -> int:
+        """Pending queue rows owned by this Telegram user (parallel job limit)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(1) AS c FROM tasks WHERE telegram_user_id = ?",
+                (int(telegram_user_id),),
             ).fetchone()
             return int(row["c"] if row else 0)
 

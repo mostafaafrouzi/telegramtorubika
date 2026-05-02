@@ -25,6 +25,16 @@ from rubpy.crypto import Crypto
 from Crypto.PublicKey import RSA
 from Crypto.Signature import pkcs1_15
 from queue_db import QueueDB
+from user_entitlements import (
+    DISABLE_USAGE_LIMITS,
+    add_bonus_month_mb,
+    can_enqueue,
+    estimate_task_bytes,
+    effective_max_file_bytes,
+    get_usage_snapshot,
+    parallel_job_count,
+    set_user_tier,
+)
 
 load_dotenv()
 
@@ -75,8 +85,47 @@ def max_file_mb_display() -> str:
     return str(b // (1024 * 1024))
 
 
+def effective_max_mb_display(user_id: int) -> str:
+    b = effective_max_file_bytes(user_id)
+    if b is None:
+        return "∞"
+    return f"{b / (1024 * 1024):.0f}"
+
+
 def fmt_mb_bytes(n: int) -> str:
     return f"{n / (1024 * 1024):.1f}"
+
+
+def quota_fail_text(user_id: int, code: str, detail: dict) -> str:
+    if code == "quota_parallel":
+        return tr(
+            user_id,
+            "quota_parallel_msg",
+            cur=detail.get("parallel", 0),
+            maxp=detail.get("max_parallel", 0),
+        )
+    if code == "quota_day":
+        return tr(
+            user_id,
+            "quota_day_msg",
+            need=detail.get("need_mb", "?"),
+            left=f'{detail.get("remain_day_mb", 0):.1f}',
+        )
+    if code == "quota_month":
+        return tr(
+            user_id,
+            "quota_month_msg",
+            need=detail.get("need_mb", "?"),
+            left=f'{detail.get("remain_month_mb", 0):.1f}',
+        )
+    if code == "quota_file_cap":
+        return tr(
+            user_id,
+            "quota_file_cap_msg",
+            max_mb=detail.get("max_mb", 0),
+            need_mb=detail.get("need_mb", "?"),
+        )
+    return tr(user_id, "quota_unknown")
 
 
 ADMIN_IDS = {
@@ -187,7 +236,8 @@ I18N = {
             "- وضعیت شبکه: `/netstatus`\n"
             "- پنل ادمین: `/admin`\n"
             "- حذف یک job: `/del <job_id>`\n\n"
-            "برای راهنمای تحلیل لاگ: `/loghelp`"
+            "برای راهنمای تحلیل لاگ: `/loghelp`\n"
+            "• مصرف و سهمیه: `/usage`"
         ),
         "loghelp_body": (
             "راهنمای تحلیل لاگ job:\n\n"
@@ -319,7 +369,8 @@ I18N = {
         "media_download_status": "فایل دریافت شد.\n\nوضعیت: آماده‌سازی برای دانلود از تلگرام...",
         "media_zip_added": (
             "✅ فایل به جلسه ZIP اضافه شد.\n"
-            "تعداد فایل‌های فعلی: `{n}`\n\n"
+            "تعداد فایل‌های فعلی: `{n}`\n"
+            "حجم خام تقریبی: ~`{raw_mb}` مگابایت\n\n"
             "فایل بیشتر بفرست یا «پایان فایل ZIP» را بزن."
         ),
         "media_file_ready": (
@@ -334,8 +385,26 @@ I18N = {
         "confirm_cancelled": "ارسال لغو شد.",
         "cleanup_done": "پاکسازی `downloads/`: {n} فایل، حدود {mb} MB آزاد شد.",
         "direct_need_rubika": "برای حالت مستقیم اول `/rubika_connect` بزن.",
-        "file_too_large": "فایل از سقف مجاز بزرگ‌تر است (حداکثر `{max_mb}` مگابایت). حجم این فایل: ~`{size_mb}` مگابایت. در `.env` مقدار `MAX_FILE_MB` را ببین یا فایل را کوچک‌تر کن.",
-        "admin_max_file": "`MAX_FILE_MB` (سقف آپلود): `{mb}` (`0` یا خالی = بدون سقف)",
+        "file_too_large": "فایل از سقف مجاز بزرگ‌تر است (حداکثر ~`{max_mb}` مگابایت با توجه به پلن و `MAX_FILE_MB`). حجم این فایل: ~`{size_mb}` مگابایت.",
+        "admin_max_file": "`MAX_FILE_MB` (سقف آپلود env): `{mb}` (`0` یا خالی = بدون سقف env)",
+        "admin_plan_note": "سهمیه پلن‌ها در SQLite (`user_entitlements`) — `/usage` برای کاربران.",
+        "quota_parallel_msg": "سقف کارهای همزمان در صف پر است (`{cur}` / `{maxp}`). بعد از اتمام یکی دوباره تلاش کن.",
+        "quota_day_msg": "سقف حجم روزانه پر است. این کار ~{need} MB است؛ حدود `{left}` MB امروز باقی مانده.",
+        "quota_month_msg": "سقف حجم ماهانه پر است. این کار ~{need} MB است؛ حدود `{left}` MB این ماه باقی مانده.",
+        "quota_file_cap_msg": "حجم این کار از سقف هر فایل بیشتر است (حداکثر `{max_mb}` MB، این فایل ~{need_mb} MB).",
+        "quota_unknown": "سقف مجاز پر است. `/usage` را بزن یا با ادمین تماس بگیر.",
+        "usage_panel": (
+            "مصرف و محدودیت:\n"
+            "• پلن: `{tier}`\n"
+            "• امروز: ~{day_used} / {day_cap} MB\n"
+            "• این ماه: ~{month_used} / {month_cap} MB\n"
+            "• حداکثر هر فایل: `{max_file}` MB\n"
+            "• همزمان در صف/پردازش: `{parallel}` / `{max_parallel}`\n\n"
+            "موفقیت ارسال به روبیکا به مصرف اضافه می‌شود."
+        ),
+        "usage_disabled_hint": "سهمیه‌گذاری با `DISABLE_USAGE_LIMITS` خاموش است (فقط محدودیت env در صورت تنظیم).",
+        "batch_raw_hint": "جمع حجم خام فعلی: ~`{raw_mb}` MB ({n} فایل). بعد از ZIP ممکن است کمی فرق کند.",
+        "direct_url_use_sendlink": "برای لینک از دکمه یا دستور `/sendlink` استفاده کن.",
     },
     "en": {
         "welcome": (
@@ -424,7 +493,8 @@ I18N = {
             "- Network: `/netstatus`\n"
             "- Admin: `/admin`\n"
             "- Remove one job: `/del <job_id>`\n\n"
-            "Log analysis: `/loghelp`"
+            "Log analysis: `/loghelp`\n"
+            "Usage & limits: `/usage`"
         ),
         "loghelp_body": (
             "Job log analysis:\n\n"
@@ -556,7 +626,8 @@ I18N = {
         "media_download_status": "Received.\n\nPreparing download from Telegram...",
         "media_zip_added": (
             "✅ Added to ZIP batch.\n"
-            "Files in batch: `{n}`\n\n"
+            "Files in batch: `{n}`\n"
+            "Approx. raw total: ~`{raw_mb}` MB\n\n"
             "Send more or tap «End ZIP»."
         ),
         "media_file_ready": (
@@ -571,8 +642,26 @@ I18N = {
         "confirm_cancelled": "Send cancelled.",
         "cleanup_done": "Cleaned `downloads/`: {n} files, ~{mb} MB freed.",
         "direct_need_rubika": "Link Rubika first: `/rubika_connect`",
-        "file_too_large": "File exceeds the configured limit (max `{max_mb}` MB). This file is ~`{size_mb}` MB. Adjust `MAX_FILE_MB` in `.env` or send a smaller file.",
-        "admin_max_file": "`MAX_FILE_MB` cap: `{mb}` (`0` or empty = unlimited)",
+        "file_too_large": "File exceeds the limit (max ~`{max_mb}` MB from plan + `MAX_FILE_MB`). This file is ~`{size_mb}` MB.",
+        "admin_max_file": "`MAX_FILE_MB` (env cap): `{mb}` (`0` or empty = no env cap)",
+        "admin_plan_note": "Per-user plans live in SQLite (`user_entitlements`). Users: `/usage`.",
+        "quota_parallel_msg": "Too many jobs at once for your plan (`{cur}` / `{maxp}`). Wait for one to finish.",
+        "quota_day_msg": "Daily data limit reached. This job ~{need} MB; ~{left} MB left today.",
+        "quota_month_msg": "Monthly data limit reached. This job ~{need} MB; ~{left} MB left this month.",
+        "quota_file_cap_msg": "This file exceeds the per-file cap (`{max_mb}` MB max; yours ~{need_mb} MB).",
+        "quota_unknown": "Quota blocked. Try `/usage` or contact admin.",
+        "usage_panel": (
+            "Usage & limits:\n"
+            "• Tier: `{tier}`\n"
+            "• Today: ~{day_used} / {day_cap} MB\n"
+            "• This month: ~{month_used} / {month_cap} MB\n"
+            "• Max per file: `{max_file}` MB\n"
+            "• Parallel jobs: `{parallel}` / `{max_parallel}`\n\n"
+            "Usage increments when Rubika upload succeeds."
+        ),
+        "usage_disabled_hint": "Quotas are off (`DISABLE_USAGE_LIMITS`). Only optional env caps apply.",
+        "batch_raw_hint": "Current raw total ~`{raw_mb}` MB ({n} files). ZIP size may differ slightly.",
+        "direct_url_use_sendlink": "For links use the button or `/sendlink`.",
     },
 }
 
@@ -1128,6 +1217,39 @@ async def rubika_sign_in(session_name: str, phone_number: str, phone_code_hash: 
 queue = QueueDB()
 
 
+async def gate_quota(message: Message, user_id: int, task: dict) -> bool:
+    """Return True if the user may enqueue this task."""
+    task["telegram_user_id"] = user_id
+    est = estimate_task_bytes(task)
+    ok, code, det = can_enqueue(user_id, est, queue)
+    if ok:
+        return True
+    await message.reply_text(quota_fail_text(user_id, code, det), parse_mode=None)
+    log_event("quota_blocked", user_id=user_id, code=code)
+    return False
+
+
+def usage_report_text(user_id: int) -> str:
+    if DISABLE_USAGE_LIMITS:
+        return tr(user_id, "usage_disabled_hint")
+    u = get_usage_snapshot(user_id)
+    day_u = u["day_bytes"] / (1024 * 1024)
+    month_u = u["month_bytes"] / (1024 * 1024)
+    cur_par = parallel_job_count(user_id, queue)
+    return tr(
+        user_id,
+        "usage_panel",
+        tier=u["tier"],
+        day_used=f"{day_u:.1f}",
+        day_cap=u["quota_day_mb"],
+        month_used=f"{month_u:.1f}",
+        month_cap=u["quota_month_mb"],
+        max_file=u["max_file_mb"],
+        parallel=cur_par,
+        max_parallel=u["max_parallel"],
+    )
+
+
 def mark_deleted(task: dict):
     queue.mark_deleted(task)
 
@@ -1449,6 +1571,8 @@ async def enqueue_rubika_text_message(message: Message, text_body: str) -> None:
         "text": text_body,
         "rubika_session": session_name,
     }
+    if not await gate_quota(message, user_id, task):
+        return
     status = await message.reply_text(tr(user_id, "text_queueing"))
     task["chat_id"] = message.chat.id
     task["status_message_id"] = status.id
@@ -1477,7 +1601,10 @@ async def queue_or_confirm(
     status_message: Optional[Message] = None,
 ):
     user_id = message.from_user.id
+    task["telegram_user_id"] = user_id
     if is_direct_mode(user_id):
+        if not await gate_quota(message, user_id, task):
+            return
         anchor = status_message
         if anchor:
             task["chat_id"] = message.chat.id
@@ -1590,11 +1717,75 @@ async def admin_handler(client: Client, message: Message):
         )
         + "\n"
         + tr(uid, "admin_max_file", mb=max_file_mb_display())
+        + "\n"
+        + tr(uid, "admin_plan_note")
         + "\n\n"
         + admin_disk_report_text(),
         reply_markup=build_admin_menu(uid),
         parse_mode=None,
     )
+
+
+@app.on_message(filters.private & filters.command("usage"))
+async def usage_handler(client: Client, message: Message):
+    await message.reply_text(usage_report_text(message.from_user.id), parse_mode=None)
+
+
+@app.on_message(filters.private & filters.command("admin_tier"))
+async def admin_tier_handler(client: Client, message: Message):
+    uid = message.from_user.id
+    if uid not in ADMIN_IDS:
+        await message.reply_text(tr(uid, "admin_denied"))
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 3:
+        await message.reply_text(
+            "Usage: `/admin_tier <telegram_user_id> <guest|free|pro> [days_valid_for_pro]`",
+            parse_mode=None,
+        )
+        return
+    try:
+        target = int(parts[1].strip())
+    except ValueError:
+        await message.reply_text("Invalid user id.", parse_mode=None)
+        return
+    tier = parts[2].strip().lower()
+    exp = 0
+    if len(parts) >= 4:
+        try:
+            days = int(parts[3].strip())
+            if tier == "pro" and days > 0:
+                exp = int(time.time()) + days * 86400
+        except ValueError:
+            pass
+    set_user_tier(target, tier, exp)
+    await message.reply_text(
+        f"OK: user `{target}` tier=`{tier}` expires_at=`{exp}`",
+        parse_mode=None,
+    )
+
+
+@app.on_message(filters.private & filters.command("admin_bonus"))
+async def admin_bonus_handler(client: Client, message: Message):
+    uid = message.from_user.id
+    if uid not in ADMIN_IDS:
+        await message.reply_text(tr(uid, "admin_denied"))
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 3:
+        await message.reply_text(
+            "Usage: `/admin_bonus <telegram_user_id> <extra_month_mb>`",
+            parse_mode=None,
+        )
+        return
+    try:
+        target = int(parts[1].strip())
+        mb = int(parts[2].strip())
+    except ValueError:
+        await message.reply_text("Invalid numbers.", parse_mode=None)
+        return
+    add_bonus_month_mb(target, mb)
+    await message.reply_text(f"OK: +{mb} MB monthly bonus for user `{target}`", parse_mode=None)
 
 
 @app.on_message(filters.private & filters.command("cleanup_downloads"))
@@ -1794,6 +1985,9 @@ async def callback_handler(client: Client, callback_query):
         if not task:
             await callback_query.answer("Pending task not found", show_alert=True)
             return
+        if not await gate_quota(callback_query.message, user_id, task):
+            await callback_query.answer("Quota", show_alert=True)
+            return
         anchor = callback_query.message
         task["chat_id"] = anchor.chat.id
         task["status_message_id"] = anchor.id
@@ -1973,7 +2167,7 @@ async def delete_one_handler(client: Client, message: Message):
         return
 
 
-@app.on_message(filters.private & filters.text & ~filters.command(["start", "menu", "lang", "help", "loghelp", "version", "rubika_status", "rubika_connect", "directmode", "netstatus", "admin", "safemode", "del", "delall", "newbatch", "done", "sendtext", "sendlink", "queue"]))
+@app.on_message(filters.private & filters.text & ~filters.command(["start", "menu", "lang", "help", "loghelp", "version", "rubika_status", "rubika_connect", "directmode", "netstatus", "admin", "safemode", "del", "delall", "newbatch", "done", "sendtext", "sendlink", "queue", "usage", "admin_tier", "admin_bonus"]))
 async def text_handler(client: Client, message: Message):
     global waiting_for_zip_password
 
@@ -2192,10 +2386,18 @@ async def text_handler(client: Client, message: Message):
     if state.get("step") == "await_zip_name":
         zip_name = safe_filename(text.strip() or "bundle")
         await safe_delete_user_message(message)
+        bf = state.get("batch_files", [])
+        fps = [Path(p) for p in bf if Path(p).exists()]
+        raw_sum = sum(p.stat().st_size for p in fps)
+        prompt_body = (
+            tr(user_id, "part_mb_prompt")
+            + "\n\n"
+            + tr(user_id, "batch_raw_hint", raw_mb=fmt_mb_bytes(raw_sum), n=len(fps))
+        )
         await edit_wizard(
             state.get("wizard_chat_id", message.chat.id),
             int(state.get("wizard_message_id", 0) or 0),
-            tr(user_id, "part_mb_prompt"),
+            prompt_body,
         )
         set_state(
             user_id,
@@ -2232,8 +2434,8 @@ async def text_handler(client: Client, message: Message):
         zip_path = make_bundle_zip_local(file_paths, state.get("zip_name", "bundle"), zip_password)
         total_size = sum(p.stat().st_size for p in file_paths if p.exists())
         zip_sz = zip_path.stat().st_size
-        lim = max_file_bytes()
-        if lim and zip_sz > lim:
+        lim_b = effective_max_file_bytes(user_id)
+        if lim_b is not None and zip_sz > lim_b:
             try:
                 zip_path.unlink()
             except Exception:
@@ -2242,11 +2444,20 @@ async def text_handler(client: Client, message: Message):
                 tr(
                     user_id,
                     "file_too_large",
-                    max_mb=max_file_mb_display(),
+                    max_mb=effective_max_mb_display(user_id),
                     size_mb=fmt_mb_bytes(zip_sz),
                 ),
                 parse_mode=None,
             )
+            clear_state(user_id)
+            clear_batch(user_id)
+            return
+        qt = {"type": "local_file", "file_size": zip_sz, "rubika_session": session_name}
+        if not await gate_quota(message, user_id, qt):
+            try:
+                zip_path.unlink()
+            except Exception:
+                pass
             clear_state(user_id)
             clear_batch(user_id)
             return
@@ -2288,6 +2499,7 @@ async def text_handler(client: Client, message: Message):
             "rubika_session": session_name,
             "safe_mode": False,
             "zip_password": "",
+            "telegram_user_id": user_id,
         }
         clear_state(user_id)
         clear_batch(user_id)
@@ -2326,6 +2538,8 @@ async def text_handler(client: Client, message: Message):
             "text": text,
             "rubika_session": session_name,
         }
+        if not await gate_quota(message, user_id, task):
+            return
         status = await message.reply_text(tr(user_id, "text_queueing"))
         task["chat_id"] = message.chat.id
         task["status_message_id"] = status.id
@@ -2351,7 +2565,7 @@ async def text_handler(client: Client, message: Message):
 
     if not url or not is_direct_url(url):
         return
-    await message.reply_text("برای لینک از دکمه/دستور «ارسال لینک» استفاده کن.")
+    await message.reply_text(tr(user_id, "direct_url_use_sendlink"), parse_mode=None)
 
     
 @app.on_message(
@@ -2403,8 +2617,8 @@ async def media_handler(client: Client, message: Message):
             raise RuntimeError("Downloaded file not found.")
 
         file_size = downloaded_path.stat().st_size
-        lim = max_file_bytes()
-        if lim and file_size > lim:
+        lim_b = effective_max_file_bytes(user_id)
+        if lim_b is not None and file_size > lim_b:
             try:
                 downloaded_path.unlink()
             except Exception:
@@ -2413,7 +2627,7 @@ async def media_handler(client: Client, message: Message):
                 tr(
                     user_id,
                     "file_too_large",
-                    max_mb=max_file_mb_display(),
+                    max_mb=effective_max_mb_display(user_id),
                     size_mb=fmt_mb_bytes(file_size),
                 ),
                 parse_mode=None,
@@ -2427,8 +2641,21 @@ async def media_handler(client: Client, message: Message):
             files.append(str(downloaded_path))
             batch["files"] = files
             set_batch(user_id, batch)
+            raw_tot = 0
+            for pstr in files:
+                try:
+                    pp = Path(pstr)
+                    if pp.exists():
+                        raw_tot += pp.stat().st_size
+                except OSError:
+                    pass
             await status.edit_text(
-                tr(user_id, "media_zip_added", n=len(files)),
+                tr(
+                    user_id,
+                    "media_zip_added",
+                    n=len(files),
+                    raw_mb=fmt_mb_bytes(raw_tot),
+                ),
                 parse_mode=None,
             )
             return
@@ -2442,6 +2669,7 @@ async def media_handler(client: Client, message: Message):
             "safe_mode": settings.get("safe_mode", False),
             "zip_password": settings.get("zip_password", ""),
             "rubika_session": session_name,
+            "telegram_user_id": user_id,
         }
 
         await status.edit_text(

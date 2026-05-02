@@ -1,4 +1,6 @@
+import hashlib
 import os
+import random
 import re
 import json
 import time
@@ -13,8 +15,18 @@ from urllib.parse import urlparse
 import threading
 
 from queue_db import QueueDB
+from user_entitlements import (
+    can_enqueue,
+    record_successful_upload_bytes,
+)
 
 load_dotenv()
+
+ENABLE_UPLOAD_CHECKSUM = os.getenv("ENABLE_UPLOAD_CHECKSUM", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 SESSION = os.getenv("RUBIKA_SESSION", "rubika_session").strip()
 
@@ -246,6 +258,24 @@ def send_with_retry(file_path: str, caption: str = "", task: dict | None = None,
 
             per_attempt = min(get_per_attempt_timeout(file_path), remaining)
 
+            if ENABLE_UPLOAD_CHECKSUM and task:
+                try:
+                    h = hashlib.md5()
+                    with open(file_path, "rb") as bf:
+                        for chunk in iter(lambda: bf.read(1024 * 1024), b""):
+                            h.update(chunk)
+                    worker_log(
+                        "phase",
+                        chat_id=task.get("chat_id"),
+                        job_id=task.get("job_id"),
+                        phase="upload_checksum",
+                        md5_hex=h.hexdigest(),
+                        file=os.path.basename(file_path),
+                        attempt=attempt,
+                    )
+                except Exception:
+                    pass
+
             return send_with_timeout(file_path, caption, per_attempt, session_name=session_name)
 
         except Exception as e:
@@ -276,7 +306,8 @@ def send_with_retry(file_path: str, caption: str = "", task: dict | None = None,
                         "uploading"
                     )
 
-                time.sleep(3)
+                backoff = min(90.0, (2 ** (attempt - 1)) * 1.5 + random.uniform(0, 2.5))
+                time.sleep(backoff)
                 continue
 
     raise last_error if last_error else RuntimeError("Upload failed.")
@@ -431,6 +462,20 @@ def append_failed(task: dict, error: str) -> None:
     with open(FAILED_FILE, "a", encoding="utf-8") as file:
         file.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
+
+def telegram_uid(task: dict) -> int:
+    try:
+        return int(task.get("telegram_user_id") or task.get("chat_id") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def bill_upload_usage(task: dict, total_bytes: int) -> None:
+    uid = telegram_uid(task)
+    if uid > 0 and total_bytes > 0:
+        record_successful_upload_bytes(uid, total_bytes)
+
+
 def process_task(task: dict):
     task_started_at = time.time()
     task_type = task.get("type")
@@ -474,8 +519,22 @@ def process_task(task: dict):
             file_name=local_path.name if local_path else "",
             file_size=local_path.stat().st_size if local_path and local_path.exists() else 0,
         )
+        uid_dl = telegram_uid(task)
+        sz_dl = local_path.stat().st_size if local_path.exists() else 0
+        ok_dl, qcode_dl, _ = can_enqueue(uid_dl, sz_dl, queue_db)
+        if not ok_dl:
+            try:
+                if local_path.exists():
+                    local_path.unlink()
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"سقف مجاز برای این حجم پر است ({qcode_dl}). در ربات دستور /usage را بزن."
+            )
     elif task_type == "text_message":
-        send_text_message(task.get("text", ""), session_name=session_name)
+        body = task.get("text") or ""
+        send_text_message(body, session_name=session_name)
+        bill_upload_usage(task, len(body.encode("utf-8")))
         push_status(task, "متن/لینک با موفقیت در روبیکا ارسال شد.", "done")
         wl(
             "task_done",
@@ -490,6 +549,12 @@ def process_task(task: dict):
             raise RuntimeError("فایلی برای ساخت bundle پیدا نشد.")
         push_status(task, "در حال ساخت zip گروهی ...", "processing")
         zip_password = task.get("zip_password", "") if task.get("safe_mode") else ""
+        wl(
+            "phase",
+            job_id=task.get("job_id"),
+            phase="bundle_zip_started",
+            files=len(files),
+        )
         zip_started_at = time.time()
         bundle = make_bundle_zip(files, task.get("zip_name", "bundle"), zip_password)
         wl(
@@ -515,14 +580,24 @@ def process_task(task: dict):
             duration_ms=int((time.time() - split_started_at) * 1000),
         )
         try:
+            total_uploaded = 0
             for idx, part in enumerate(parts, start=1):
                 push_status(
                     task,
                     f"ارسال پارت {idx} از {len(parts)} به روبیکا ...",
                     "uploading",
                 )
+                wl(
+                    "phase",
+                    job_id=task.get("job_id"),
+                    phase="upload_part_started",
+                    part_index=idx,
+                    parts_total=len(parts),
+                    part_name=part.name,
+                )
                 part_started_at = time.time()
                 send_with_retry(str(part), caption="", task=task, session_name=session_name)
+                total_uploaded += part.stat().st_size if part.exists() else 0
                 wl(
                     "phase",
                     job_id=task.get("job_id"),
@@ -532,6 +607,7 @@ def process_task(task: dict):
                     part_size=part.stat().st_size if part.exists() else 0,
                     duration_ms=int((time.time() - part_started_at) * 1000),
                 )
+            bill_upload_usage(task, total_uploaded)
             push_status(task, "همه پارت‌ها با موفقیت در روبیکا ارسال شدند.", "done")
             wl(
                 "task_done",
@@ -565,6 +641,12 @@ def process_task(task: dict):
 
     if safe_mode and zip_password:
         push_status(task, "در حال تبدیل به فایل zip ...", "processing")
+        wl(
+            "phase",
+            job_id=task.get("job_id"),
+            phase="safe_zip_started",
+            source=local_path.name if local_path else "",
+        )
         zip_started_at = time.time()
         try:
             zipped = make_zip_with_password(local_path, zip_password)
@@ -588,6 +670,13 @@ def process_task(task: dict):
     else:
         send_path = local_path
 
+    wl(
+        "phase",
+        job_id=task.get("job_id"),
+        phase="split_started",
+        path_name=send_path.name if send_path else "",
+        file_size=send_path.stat().st_size if send_path and send_path.exists() else 0,
+    )
     split_started_at = time.time()
     send_parts = split_file_parts(send_path, part_size_mb)
     wl(
@@ -601,10 +690,20 @@ def process_task(task: dict):
     try:
         if is_cancelled(task):
             raise RuntimeError("ارسال لغو شد.")
+        total_sent = 0
         for idx, part in enumerate(send_parts, start=1):
             part_caption = caption if idx == 1 else f"{caption}\npart {idx}/{len(send_parts)}"
+            wl(
+                "phase",
+                job_id=task.get("job_id"),
+                phase="upload_part_started",
+                part_index=idx,
+                parts_total=len(send_parts),
+                part_name=part.name,
+            )
             part_started_at = time.time()
             send_with_retry(str(part), part_caption, task, session_name=session_name)
+            total_sent += part.stat().st_size if part.exists() else 0
             wl(
                 "phase",
                 job_id=task.get("job_id"),
@@ -615,6 +714,7 @@ def process_task(task: dict):
                 duration_ms=int((time.time() - part_started_at) * 1000),
             )
 
+        bill_upload_usage(task, total_sent)
         push_status(
             task,
             "فایل با موفقیت در روبیکا آپلود شد.",

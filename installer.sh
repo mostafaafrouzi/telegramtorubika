@@ -409,7 +409,7 @@ post_deploy_health_check(){
     run_cmd "service is-active check" systemctl is-active --quiet "$base"
     run_cmd "service is-enabled check" systemctl is-enabled --quiet "$base"
   fi
-  run_cmd "python syntax smoke check" "$dir/venv/bin/python" -m py_compile "$dir/main.py" "$dir/telebot.py" "$dir/rub.py" "$dir/queue_db.py"
+  run_cmd "python syntax smoke check" "$dir/venv/bin/python" -m py_compile "$dir/main.py" "$dir/telebot.py" "$dir/rub.py" "$dir/queue_db.py" "$dir/user_entitlements.py"
   ok "Health check passed for systemd_base=$base split=$split dir=$dir"
   log_event "OK" "health_check_passed" "systemd_base=$base split=$split dir=$dir"
 }

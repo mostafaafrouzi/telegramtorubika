@@ -13,6 +13,8 @@ Repository: [github.com/mostafaafrouzi/telegramtorubika](http://github.com/mosta
 - Safe mode (zip with password)
 - Direct mode (send everything immediately to queue)
 - Interactive server installer (install/update/uninstall/backup/restore)
+- Per-user **plans & quotas** (default tiers guest/free/pro in SQLite; `/usage` for users; `/admin_tier`, `/admin_bonus` for admins; optional `DISABLE_USAGE_LIMITS=1` for private hosts)
+- Optional **`ENABLE_UPLOAD_CHECKSUM`** on worker (MD5 logged before Rubika upload); optional **`tools/payment_webhook_stub.py`** to activate paid tiers via HTTP
 
 ## Fast server install (curl)
 
