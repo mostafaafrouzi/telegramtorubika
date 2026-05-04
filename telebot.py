@@ -1,5 +1,6 @@
 import asyncio
 import json
+from functools import partial
 import os
 import re
 import shutil
@@ -10,8 +11,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
-from pyrogram import Client, filters, idle
-from pyrogram.enums import ParseMode
+from pyrogram import Client, filters
 from pyrogram.errors import MessageNotModified
 from pyrogram.types import (
     InlineKeyboardButton,
@@ -29,14 +29,65 @@ from user_entitlements import (
     DISABLE_USAGE_LIMITS,
     add_bonus_month_mb,
     can_enqueue,
+    effective_toolkit_daily_limit,
     estimate_task_bytes,
     effective_max_file_bytes,
     get_usage_snapshot,
     parallel_job_count,
     set_user_tier,
 )
+from v2.core import menu_engine
+from v2.core.menu_sections import MenuSection
+from v2.handlers.reply_routes import ReplyRouteDeps, dispatch_reply_keyboard_route
+from v2.handlers.rubika_wizard import RubikaWizardDeps, dispatch_rubika_connect_wizard
+from v2.handlers.zip_batch_wizard import ZipBatchWizardDeps, dispatch_zip_batch_wizard
+from v2.handlers.zip_password_prompt import ZipPasswordPromptDeps, handle_zip_password_text
+from v2.handlers.direct_mode_text import DirectModeTextDeps, handle_direct_mode_plain_text
+from v2.handlers.direct_url_hint import DirectUrlHintDeps, handle_direct_url_sendlink_hint
+from v2.handlers.basic_commands import BasicCommandDeps, handle_help, handle_lang, handle_log_help, handle_menu, handle_start, handle_version
+from v2.billing import maybe_grant_plan_after_paid, run_reconcile
+from v2.handlers.admin_commands import (
+    AdminCommandDeps,
+    handle_admin_bonus,
+    handle_admin_panel,
+    handle_admin_payment_lookup,
+    handle_admin_payment_status,
+    handle_admin_reconcile_billing,
+    handle_admin_tier,
+    handle_cleanup_downloads,
+)
+from v2.handlers.plan_commands import PlanCommandDeps, handle_plan, handle_purchase, handle_usage
+from v2.handlers.queue_commands import QueueCommandDeps, handle_clear_queue, handle_queue_manage, handle_send_link, handle_send_text
+from v2.handlers.safemode_command import SafeModeCommandDeps, handle_safemode
+from v2.handlers.delete_command import DeleteCommandDeps, handle_delete_one
+from v2.handlers.callback_routes import CallbackRouteDeps, dispatch_callback_route
+from v2.handlers.batch_commands import BatchCommandDeps, handle_done_batch, handle_new_batch
+from v2.handlers.text_entry import TextEntryDeps, handle_text_entry
+from v2.handlers.media_handler import MediaHandlerDeps, handle_media_message
+from v2.handlers.session_settings_commands import (
+    SessionSettingsCommandDeps,
+    handle_direct_mode,
+    handle_netstatus,
+    handle_rubika_connect,
+    handle_rubika_status,
+)
+from v2.handlers.toolkit_commands import (
+    ToolkitCommandDeps,
+    handle_b64_decode,
+    handle_b64_encode,
+    handle_dns_lookup,
+    handle_md5,
+    handle_my_ip,
+    handle_sha256,
+    handle_tcp_ping,
+)
+from v2.bot.client_factory import build_bot_client
+from v2.bot.register_handlers import register_handlers
 
 load_dotenv()
+
+# v2: logical keyboard section for analytics / future routing (stored in user_states.json)
+MENU_SECTION_KEY = "menu_section"
 
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "").strip()
@@ -64,7 +115,50 @@ DISABLE_UPDATE_BROADCAST = os.getenv("DISABLE_UPDATE_BROADCAST", "").strip().low
     "yes",
 )
 
+# When true, get_state/get_batch read SQLite mirrors first; JSON is fallback.
+# Writes remain dual (JSON + mirror). See docs/v2/09-implementation-roadmap.md.
+V2_EPHEMERAL_READ_PRIMARY_SQLITE = (os.getenv("V2_EPHEMERAL_READ_PRIMARY_SQLITE") or "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+    "sqlite",
+)
 
+BILLING_STUB_CHECKOUT = (os.getenv("BILLING_STUB_CHECKOUT") or "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+BILLING_RECONCILE_ENABLE = (os.getenv("BILLING_RECONCILE_ENABLE") or "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+try:
+    BILLING_RECONCILE_INTERVAL_SEC = max(60, int((os.getenv("BILLING_RECONCILE_INTERVAL_SEC") or "600").strip()))
+except ValueError:
+    BILLING_RECONCILE_INTERVAL_SEC = 600
+try:
+    BILLING_RECONCILE_PENDING_MAX_AGE_SEC = max(300, int((os.getenv("BILLING_RECONCILE_PENDING_MAX_AGE_SEC") or "86400").strip()))
+except ValueError:
+    BILLING_RECONCILE_PENDING_MAX_AGE_SEC = 86400
+
+# Phase 4 toolkit: wave-1 network light (DNS resolve command).
+TOOLKIT_NETWORK_LIGHT = (os.getenv("TOOLKIT_NETWORK_LIGHT") or "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+TOOLKIT_UTILITY_LIGHT = (os.getenv("TOOLKIT_UTILITY_LIGHT") or "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 def max_file_bytes() -> Optional[int]:
     """If set, reject queued uploads larger than this (from MAX_FILE_MB in .env). 0 or empty = no limit."""
     raw = (os.getenv("MAX_FILE_MB") or "").strip()
@@ -141,13 +235,12 @@ QUEUE_DIR.mkdir(parents=True, exist_ok=True)
 if not API_ID or not API_HASH or not BOT_TOKEN:
     raise RuntimeError("Please set API_ID, API_HASH and BOT_TOKEN in .env")
 
-app = Client(
+app = build_bot_client(
     "tel2rub",
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
 )
-app.set_parse_mode(ParseMode.MARKDOWN)
 
 I18N = {
     "fa": {
@@ -162,8 +255,8 @@ I18N = {
         ),
         "menu_intro": (
             "منوی اصلی:\n"
-            "- ردیف «پلن»: دستورهای `/plan` · `/usage` · `/queue` · `/purchase` روی کیبورد\n"
-            "- «پلن و خرید»: همان گزینه‌ها در یک زیرمنو\n"
+            "- «📋 پلن / خرید / محدودیت»: ورود به زیرمنو؛ آنجا `/plan` · `/usage` · `/queue` · `/purchase` هست\n"
+            "(می‌توانی همین دستورها را مستقیم تایپ کنی و بدون زیرمنو هم کار می‌کنند)\n"
             "- منوی اتصال: مدیریت اتصال روبیکا\n"
             "- منوی فایل‌ها: فایل ZIP، ارسال متن/لینک، مدیریت صف\n"
             "- منوی تنظیمات: حالت مستقیم\n"
@@ -400,6 +493,45 @@ I18N = {
         "file_too_large": "فایل از سقف مجاز بزرگ‌تر است (حداکثر ~`{max_mb}` مگابایت با توجه به پلن و `MAX_FILE_MB`). حجم این فایل: ~`{size_mb}` مگابایت.",
         "admin_max_file": "`MAX_FILE_MB` (سقف آپلود env): `{mb}` (`0` یا خالی = بدون سقف env)",
         "admin_plan_note": "سهمیه پلن‌ها در SQLite (`user_entitlements`) — `/usage` برای کاربران.",
+        "admin_clear_prefs_hint": "پاک کردن ردیف mirror prefs در SQLite: `/admin_clear_prefs <telegram_user_id>`",
+        "admin_clear_state_mirrors_hint": "پاک mirror ویزارد/بچ در SQLite (JSON را عوض نمی‌کند): `/admin_clear_state_mirrors <telegram_user_id>`",
+        "admin_payment_lookup_hint": "لیست آخرین پرداخت‌های SQLite (`v2_payments`): `/admin_payment_lookup <telegram_user_id> [limit]`",
+        "admin_payment_lookup_empty": "هیچ ردیف پرداختی برای این کاربر نیست.",
+        "admin_payment_lookup_title": "پرداخت‌ها (جدیدترین اول):\n",
+        "admin_payment_status_hint": "به‌روزرسانی وضعیت یک ردیف: `/admin_payment_status <payment_id> <status> [ref_id]`",
+        "admin_reconcile_billing_hint": "انقضای ردیف‌های قدیمی pending/initiated: `/admin_reconcile_billing`",
+        "admin_reconcile_billing_result": "Reconcile: منقضی‌شده `{expired}`، اسکن‌شده `{scanned}`.",
+        "purchase_stub_started": (
+            "💳 خرید تست (`BILLING_STUB_CHECKOUT`)\n\n"
+            "ردیف `v2_payments` ساخته شد.\n"
+            "• payment_id: `{payment_id}`\n"
+            "• authority: `{authority}`\n\n"
+            "برای اعمال پلن پرو بعد از پرداخت موفق، وضعیت را `paid` کنید:\n"
+            "وب‌هوک `POST …/v2_payment_event` یا `/admin_payment_status <id> paid`."
+        ),
+        "toolkit_network_disabled": "ابزارهای شبکه با env (`TOOLKIT_NETWORK_LIGHT`) خاموش است.",
+        "toolkit_utility_disabled": "ابزارهای متنی با env (`TOOLKIT_UTILITY_LIGHT`) خاموش است.",
+        "toolkit_quota_exceeded": (
+            "سهمیهٔ روزانهٔ ابزار تمام شد ({used}/{limit}). فردا دوباره امتحان کنید."
+        ),
+        "toolkit_dns_usage": "استفاده: `/dns <hostname>` — مثال: `/dns example.com`",
+        "toolkit_dns_result": "`{host}`:\n{ips}",
+        "toolkit_dns_error": "DNS برای `{host}`:\n{error}",
+        "toolkit_myip_result": "IP خروجی سرور (اینترنت):\n`{ip}`",
+        "toolkit_myip_error": "خطا در گرفتن IP:\n{error}",
+        "toolkit_ping_usage": "استفاده: `/ping <host> [port]` — پیش‌فرض پورت 443 (TCP). مثال: `/ping example.com 80`",
+        "toolkit_ping_result": "TCP `{host}:{port}` ≈ `{ms}` ms",
+        "toolkit_ping_error": "`{host}:{port}` — {error}",
+        "toolkit_md5_usage": "استفاده: `/md5 <متن>` — MD5 روی UTF-8",
+        "toolkit_md5_result": "`{digest}`",
+        "toolkit_sha256_usage": "استفاده: `/sha256 <متن>`",
+        "toolkit_sha256_result": "`{digest}`",
+        "toolkit_b64e_usage": "استفاده: `/b64e <متن>` — Base64 استاندارد",
+        "toolkit_b64e_result": "`{data}`",
+        "toolkit_b64d_usage": "استفاده: `/b64d <رشته Base64>`",
+        "toolkit_b64d_result": "{data}",
+        "toolkit_b64d_error": "decode ناموفق: {error}",
+        "toolkit_input_truncated": "(ورودی به سقف ۱۲۰۰۰ نویسه بریده شد.)",
         "quota_parallel_msg": "سقف کارهای همزمان در صف پر است (`{cur}` / `{maxp}`). بعد از اتمام یکی دوباره تلاش کن.",
         "quota_day_msg": "سقف حجم روزانه پر است. این کار ~{need} MB است؛ حدود `{left}` MB امروز باقی مانده.",
         "quota_month_msg": "سقف حجم ماهانه پر است. این کار ~{need} MB است؛ حدود `{left}` MB این ماه باقی مانده.",
@@ -442,8 +574,8 @@ I18N = {
         ),
         "menu_intro": (
             "Main menu:\n"
-            "- Plan row: `/plan` · `/usage` · `/queue` · `/purchase` on the keyboard\n"
-            "- «Plan / billing»: same shortcuts grouped\n"
+            "- «📋 Plan / billing / limits»: opens submenu with `/plan` · `/usage` · `/queue` · `/purchase`\n"
+            "(you can still type those commands anytime)\n"
             "- Connection: Rubika link\n"
             "- Files: ZIP batch, text/link, queue\n"
             "- Settings: direct mode\n"
@@ -680,6 +812,43 @@ I18N = {
         "file_too_large": "File exceeds the limit (max ~`{max_mb}` MB from plan + `MAX_FILE_MB`). This file is ~`{size_mb}` MB.",
         "admin_max_file": "`MAX_FILE_MB` (env cap): `{mb}` (`0` or empty = no env cap)",
         "admin_plan_note": "Per-user plans live in SQLite (`user_entitlements`). Users: `/usage`.",
+        "admin_clear_prefs_hint": "Clear cached `v2_user_prefs` row: `/admin_clear_prefs <telegram_user_id>`",
+        "admin_clear_state_mirrors_hint": "Clear wizard/batch SQLite mirrors only (not JSON files): `/admin_clear_state_mirrors <telegram_user_id>`",
+        "admin_payment_lookup_hint": "Recent `v2_payments` rows: `/admin_payment_lookup <telegram_user_id> [limit]`",
+        "admin_payment_lookup_empty": "No payment rows for this user.",
+        "admin_payment_lookup_title": "Payments (newest first):\n",
+        "admin_payment_status_hint": "Set one payment row status: `/admin_payment_status <payment_id> <status> [ref_id]`",
+        "admin_reconcile_billing_hint": "Expire stale pending/initiated payments: `/admin_reconcile_billing`",
+        "admin_reconcile_billing_result": "Reconcile: expired `{expired}`, scanned `{scanned}`.",
+        "purchase_stub_started": (
+            "💳 Test checkout (`BILLING_STUB_CHECKOUT`)\n\n"
+            "Created `v2_payments` row.\n"
+            "• payment_id: `{payment_id}`\n"
+            "• authority: `{authority}`\n\n"
+            "To grant Pro after success, set status to `paid`:\n"
+            "`POST …/v2_payment_event` or `/admin_payment_status <id> paid`."
+        ),
+        "toolkit_network_disabled": "Network toolkit is off (set `TOOLKIT_NETWORK_LIGHT`).",
+        "toolkit_utility_disabled": "Text/encoding toolkit is off (set `TOOLKIT_UTILITY_LIGHT`).",
+        "toolkit_quota_exceeded": "Daily toolkit quota reached ({used}/{limit}). Try again tomorrow.",
+        "toolkit_dns_usage": "Usage: `/dns <hostname>` — e.g. `/dns example.com`",
+        "toolkit_dns_result": "`{host}`:\n{ips}",
+        "toolkit_dns_error": "DNS error for `{host}`:\n{error}",
+        "toolkit_myip_result": "Server egress IP:\n`{ip}`",
+        "toolkit_myip_error": "Could not fetch IP:\n{error}",
+        "toolkit_ping_usage": "Usage: `/ping <host> [port]` — default port 443 (TCP). E.g. `/ping example.com 80`",
+        "toolkit_ping_result": "TCP `{host}:{port}` ~ `{ms}` ms",
+        "toolkit_ping_error": "`{host}:{port}` — {error}",
+        "toolkit_md5_usage": "Usage: `/md5 <text>` — MD5 (UTF-8)",
+        "toolkit_md5_result": "`{digest}`",
+        "toolkit_sha256_usage": "Usage: `/sha256 <text>`",
+        "toolkit_sha256_result": "`{digest}`",
+        "toolkit_b64e_usage": "Usage: `/b64e <text>` — standard Base64",
+        "toolkit_b64e_result": "`{data}`",
+        "toolkit_b64d_usage": "Usage: `/b64d <base64 string>`",
+        "toolkit_b64d_result": "{data}",
+        "toolkit_b64d_error": "Decode failed: {error}",
+        "toolkit_input_truncated": "(Input truncated to 12000 characters.)",
         "quota_parallel_msg": "Too many jobs at once for your plan (`{cur}` / `{maxp}`). Wait for one to finish.",
         "quota_day_msg": "Daily data limit reached. This job ~{need} MB; ~{left} MB left today.",
         "quota_month_msg": "Monthly data limit reached. This job ~{need} MB; ~{left} MB left this month.",
@@ -718,6 +887,13 @@ def get_lang(user_id: int) -> str:
     lang = users.get(get_user_key(user_id), {}).get("lang")
     if lang in ("fa", "en"):
         return lang
+    try:
+        db_lang = queue.get_lang(user_id)
+    except Exception as e:
+        log_event("v2_user_prefs_lang_read_failed", user_id=user_id, error=str(e))
+        return "fa"
+    if db_lang in ("fa", "en"):
+        return db_lang
     return "fa"
 
 
@@ -730,6 +906,10 @@ def set_lang(user_id: int, lang: str):
     item["lang"] = lang
     users[key] = item
     save_users(users)
+    try:
+        queue.upsert_lang(user_id, lang)
+    except Exception as e:
+        log_event("v2_user_prefs_lang_upsert_failed", user_id=user_id, error=str(e))
 
 
 def tr(user_id: int, key: str, **kwargs) -> str:
@@ -855,123 +1035,27 @@ def recent_failed_detail_text(session: Optional[str], limit: int = 8) -> str:
 
 
 def build_main_menu(user_id: int) -> ReplyKeyboardMarkup:
-    rows = [
-        [
-            KeyboardButton("/plan"),
-            KeyboardButton("/usage"),
-        ],
-        [
-            KeyboardButton("/queue"),
-            KeyboardButton("/purchase"),
-        ],
-        [KeyboardButton(tr(user_id, "btn_main_plan_section"))],
-        [
-            KeyboardButton(tr(user_id, "btn_main_connection")),
-            KeyboardButton(tr(user_id, "btn_main_files")),
-        ],
-        [
-            KeyboardButton(tr(user_id, "btn_main_settings")),
-            KeyboardButton(tr(user_id, "btn_main_help")),
-        ],
-        [
-            KeyboardButton(tr(user_id, "btn_main_net")),
-            KeyboardButton(tr(user_id, "btn_main_queue")),
-        ],
-    ]
-    if user_id in ADMIN_IDS:
-        rows.append([KeyboardButton(tr(user_id, "btn_main_admin"))])
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=False)
+    return menu_engine.build_main_menu(user_id, tr, user_id in ADMIN_IDS)
 
 
 def build_plan_menu(user_id: int) -> ReplyKeyboardMarkup:
-    """Reply keyboard: plan / usage / queue / purchase (same as typing commands)."""
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [
-                KeyboardButton("/plan"),
-                KeyboardButton("/usage"),
-            ],
-            [
-                KeyboardButton("/queue"),
-                KeyboardButton("/purchase"),
-            ],
-            [KeyboardButton(tr(user_id, "btn_back_main"))],
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=False,
-    )
+    return menu_engine.build_plan_menu(user_id, tr)
 
 
 def build_rubika_menu(user_id: int) -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [
-                KeyboardButton(tr(user_id, "btn_rub_connect")),
-                KeyboardButton(tr(user_id, "btn_rub_status")),
-            ],
-            [KeyboardButton(tr(user_id, "btn_back_main"))],
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=False,
-    )
+    return menu_engine.build_rubika_menu(user_id, tr)
 
 
 def build_files_menu(user_id: int) -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [
-                KeyboardButton("/plan"),
-                KeyboardButton("/usage"),
-            ],
-            [
-                KeyboardButton("/queue"),
-                KeyboardButton("/purchase"),
-            ],
-            [KeyboardButton(tr(user_id, "btn_main_plan_section"))],
-            [
-                KeyboardButton(tr(user_id, "btn_zip_start")),
-                KeyboardButton(tr(user_id, "btn_zip_end")),
-            ],
-            [KeyboardButton(tr(user_id, "btn_send_content"))],
-            [
-                KeyboardButton(tr(user_id, "btn_queue")),
-                KeyboardButton(tr(user_id, "btn_clear_all")),
-            ],
-            [KeyboardButton(tr(user_id, "btn_back_main"))],
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=False,
-    )
+    return menu_engine.build_files_menu(user_id, tr)
 
 
 def build_settings_menu(user_id: int) -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [
-                KeyboardButton(tr(user_id, "btn_direct_on")),
-                KeyboardButton(tr(user_id, "btn_direct_off")),
-            ],
-            [KeyboardButton(tr(user_id, "btn_back_main"))],
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=False,
-    )
+    return menu_engine.build_settings_menu(user_id, tr)
 
 
 def build_admin_menu(user_id: int) -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [
-                KeyboardButton("/plan"),
-                KeyboardButton("/usage"),
-                KeyboardButton("/admin"),
-            ],
-            [KeyboardButton(tr(user_id, "btn_admin_panel")), KeyboardButton("/version")],
-            [KeyboardButton(tr(user_id, "btn_back_main"))],
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=False,
-    )
+    return menu_engine.build_admin_menu(user_id, tr)
 
 
 def safe_filename(name: Optional[str]) -> str:
@@ -1098,7 +1182,21 @@ def get_user_session(user_id: int) -> Optional[str]:
     item = users.get(get_user_key(user_id), {})
     if item.get("connected"):
         return item.get("session")
+    try:
+        db_sess = queue.get_rubika_session(user_id)
+    except Exception as e:
+        log_event("v2_user_prefs_rubika_session_read_failed", user_id=user_id, error=str(e))
+        return None
+    if db_sess:
+        return db_sess
     return None
+
+
+def _persist_rubika_session_prefs(user_id: int, session_name: str) -> None:
+    try:
+        queue.upsert_rubika_session(user_id, session_name)
+    except Exception as e:
+        log_event("v2_user_prefs_rubika_session_upsert_failed", user_id=user_id, error=str(e))
 
 
 def check_rubika_session_sync(session_name: str) -> tuple[bool, str]:
@@ -1120,8 +1218,18 @@ def check_rubika_session_sync(session_name: str) -> tuple[bool, str]:
 
 def is_direct_mode(user_id: int) -> bool:
     users = load_users()
-    item = users.get(get_user_key(user_id), {})
-    return bool(item.get("direct_mode", False))
+    key = get_user_key(user_id)
+    item = users.get(key, {})
+    if "direct_mode" in item:
+        return bool(item["direct_mode"])
+    try:
+        db_dm = queue.get_direct_mode(user_id)
+    except Exception as e:
+        log_event("v2_user_prefs_direct_mode_read_failed", user_id=user_id, error=str(e))
+        return False
+    if db_dm is not None:
+        return bool(db_dm)
+    return False
 
 
 def set_direct_mode(user_id: int, enabled: bool):
@@ -1131,6 +1239,10 @@ def set_direct_mode(user_id: int, enabled: bool):
     item["direct_mode"] = bool(enabled)
     users[key] = item
     save_users(users)
+    try:
+        queue.upsert_direct_mode(user_id, bool(enabled))
+    except Exception as e:
+        log_event("v2_user_prefs_direct_mode_upsert_failed", user_id=user_id, error=str(e))
 
 
 def load_user_states() -> dict:
@@ -1150,37 +1262,137 @@ def save_batch_sessions(data: dict):
 
 
 def get_state(user_id: int) -> dict:
-    states = load_user_states()
-    return states.get(get_user_key(user_id), {})
+    key = get_user_key(user_id)
+    s: dict = {}
+    if V2_EPHEMERAL_READ_PRIMARY_SQLITE:
+        try:
+            mirrored = queue.get_user_state_mirror(user_id)
+            if mirrored:
+                s = dict(mirrored)
+        except Exception as e:
+            log_event("v2_user_state_mirror_read_failed", user_id=user_id, error=str(e))
+        if not s:
+            states = load_user_states()
+            if key in states:
+                raw = states[key]
+                s = dict(raw) if isinstance(raw, dict) else {}
+    else:
+        states = load_user_states()
+        if key in states:
+            raw = states[key]
+            s = dict(raw) if isinstance(raw, dict) else {}
+        else:
+            try:
+                mirrored = queue.get_user_state_mirror(user_id)
+                if mirrored:
+                    s = dict(mirrored)
+            except Exception as e:
+                log_event("v2_user_state_mirror_read_failed", user_id=user_id, error=str(e))
+    if MENU_SECTION_KEY in s:
+        return s
+    try:
+        sec = queue.get_menu_section(user_id)
+    except Exception as e:
+        log_event("v2_user_prefs_read_failed", user_id=user_id, error=str(e))
+        return s
+    if not sec:
+        return s
+    out = dict(s)
+    out[MENU_SECTION_KEY] = sec
+    return out
 
 
 def set_state(user_id: int, data: dict):
     states = load_user_states()
     states[get_user_key(user_id)] = data
     save_user_states(states)
+    try:
+        queue.upsert_user_state_mirror(user_id, data)
+    except Exception as e:
+        log_event("v2_user_state_mirror_upsert_failed", user_id=user_id, error=str(e))
 
 
 def clear_state(user_id: int):
+    """Drop wizard keys from ``user_states.json`` only.
+
+    Does **not** delete ``v2_user_prefs`` so mirrors for menu/lang/direct_mode/rubika_session stay intact.
+    """
     states = load_user_states()
     states.pop(get_user_key(user_id), None)
     save_user_states(states)
+    try:
+        queue.delete_user_state_mirror(user_id)
+    except Exception as e:
+        log_event("v2_user_state_mirror_delete_failed", user_id=user_id, error=str(e))
+
+
+def merge_user_state(user_id: int, patch: dict) -> None:
+    cur = dict(get_state(user_id))
+    cur.update(patch)
+    set_state(user_id, cur)
+
+
+def set_menu_section(user_id: int, section: MenuSection) -> None:
+    merge_user_state(user_id, {MENU_SECTION_KEY: section.value})
+    try:
+        queue.upsert_menu_section(user_id, section.value)
+    except Exception as e:
+        log_event("v2_user_prefs_upsert_failed", user_id=user_id, error=str(e))
+
+
+def set_state_preserving_menu(user_id: int, new_state: dict) -> None:
+    """Replace wizard/session keys but keep MENU_SECTION_KEY if already set."""
+    prev = get_state(user_id)
+    merged = dict(new_state)
+    if MENU_SECTION_KEY in prev:
+        merged[MENU_SECTION_KEY] = prev[MENU_SECTION_KEY]
+    set_state(user_id, merged)
 
 
 def get_batch(user_id: int) -> dict:
+    key = get_user_key(user_id)
+    if V2_EPHEMERAL_READ_PRIMARY_SQLITE:
+        try:
+            mirrored = queue.get_batch_session_mirror(user_id)
+            if mirrored:
+                return dict(mirrored)
+        except Exception as e:
+            log_event("v2_batch_session_mirror_read_failed", user_id=user_id, error=str(e))
+        sessions = load_batch_sessions()
+        if key in sessions:
+            raw = sessions[key]
+            return dict(raw) if isinstance(raw, dict) else {}
+        return {}
     sessions = load_batch_sessions()
-    return sessions.get(get_user_key(user_id), {})
+    if key in sessions:
+        raw = sessions[key]
+        return dict(raw) if isinstance(raw, dict) else {}
+    try:
+        mirrored = queue.get_batch_session_mirror(user_id)
+        return dict(mirrored) if mirrored else {}
+    except Exception as e:
+        log_event("v2_batch_session_mirror_read_failed", user_id=user_id, error=str(e))
+        return {}
 
 
 def set_batch(user_id: int, data: dict):
     sessions = load_batch_sessions()
     sessions[get_user_key(user_id)] = data
     save_batch_sessions(sessions)
+    try:
+        queue.upsert_batch_session_mirror(user_id, data)
+    except Exception as e:
+        log_event("v2_batch_session_mirror_upsert_failed", user_id=user_id, error=str(e))
 
 
 def clear_batch(user_id: int):
     sessions = load_batch_sessions()
     sessions.pop(get_user_key(user_id), None)
     save_batch_sessions(sessions)
+    try:
+        queue.delete_batch_session_mirror(user_id)
+    except Exception as e:
+        log_event("v2_batch_session_mirror_delete_failed", user_id=user_id, error=str(e))
 
 
 async def rubika_send_code(session_name: str, phone_number: str, pass_key: str = ""):
@@ -1304,6 +1516,60 @@ async def rubika_sign_in(session_name: str, phone_number: str, phone_code_hash: 
             pass
 
 queue = QueueDB()
+
+
+def sync_v2_ephemeral_mirrors_from_json() -> None:
+    """Copy existing ``user_states.json`` / ``batch_sessions.json`` into SQLite mirrors.
+
+    Runs once per process start so mirrors match on-disk JSON without waiting for
+    the next ``set_state`` / ``set_batch`` per user.
+    """
+    n_state = 0
+    n_batch = 0
+    try:
+        raw_states = load_user_states()
+    except Exception as e:
+        log_event("v2_state_mirror_backfill_failed", phase="load_user_states", error=str(e))
+        raw_states = {}
+    for key, value in (raw_states or {}).items():
+        if not isinstance(key, str) or not key.isdigit():
+            continue
+        if not isinstance(value, dict):
+            continue
+        uid = int(key)
+        try:
+            queue.upsert_user_state_mirror(uid, value)
+            n_state += 1
+        except Exception as e:
+            log_event(
+                "v2_state_mirror_backfill_row_failed",
+                user_id=uid,
+                kind="user_state",
+                error=str(e),
+            )
+    try:
+        raw_batches = load_batch_sessions()
+    except Exception as e:
+        log_event("v2_state_mirror_backfill_failed", phase="load_batch_sessions", error=str(e))
+        raw_batches = {}
+    for key, value in (raw_batches or {}).items():
+        if not isinstance(key, str) or not key.isdigit():
+            continue
+        if not isinstance(value, dict):
+            continue
+        uid = int(key)
+        try:
+            queue.upsert_batch_session_mirror(uid, value)
+            n_batch += 1
+        except Exception as e:
+            log_event(
+                "v2_state_mirror_backfill_row_failed",
+                user_id=uid,
+                kind="batch_session",
+                error=str(e),
+            )
+    if n_state or n_batch:
+        log_event("v2_state_mirror_backfill_done", user_states=n_state, batch_sessions=n_batch)
 
 
 async def gate_quota(message: Message, user_id: int, task: dict) -> bool:
@@ -1549,120 +1815,140 @@ async def maybe_broadcast_update():
     log_event("update_broadcast_done", version=APP_VERSION, chats=len(ids))
 
 
-@app.on_message(filters.private & filters.command("start"))
+async def payment_reconcile_loop():
+    """Periodic stale-payment expiry when ``BILLING_RECONCILE_ENABLE`` is set."""
+    await asyncio.sleep(90)
+    while True:
+        await asyncio.sleep(BILLING_RECONCILE_INTERVAL_SEC)
+        if not BILLING_RECONCILE_ENABLE:
+            continue
+        try:
+            stats = run_reconcile(queue, pending_max_age_sec=BILLING_RECONCILE_PENDING_MAX_AGE_SEC)
+            if stats.get("expired", 0):
+                log_event("billing_reconcile_tick", **stats)
+        except Exception as e:
+            log_event("billing_reconcile_error", error=str(e))
+
+
+def _create_stub_purchase_checkout(user_id: int) -> tuple[int, str]:
+    from v2.billing import StubPaymentGateway
+
+    gw = StubPaymentGateway(queue)
+    r = gw.create_payment_intent(
+        user_id,
+        0,
+        currency="IRR",
+        metadata={"grant_tier": "pro", "grant_days": 30, "stub_checkout": True},
+    )
+    return r.payment_id, (r.authority or "")
+
+
+BASIC_COMMAND_DEPS = BasicCommandDeps(
+    tr=tr,
+    remember_chat=remember_chat,
+    set_menu_section=set_menu_section,
+    build_main_menu=build_main_menu,
+    app_version=APP_VERSION,
+)
+
+SESSION_SETTINGS_COMMAND_DEPS = SessionSettingsCommandDeps(
+    tr=tr,
+    get_user_session=get_user_session,
+    check_rubika_session_sync=check_rubika_session_sync,
+    set_menu_section=set_menu_section,
+    set_state_preserving_menu=set_state_preserving_menu,
+    log_event=log_event,
+    set_direct_mode=set_direct_mode,
+    build_settings_menu=build_settings_menu,
+    build_main_menu=build_main_menu,
+    load_network_snapshot=partial(
+        load_json,
+        NETWORK_FILE,
+        {"mode": "unknown", "reason": "", "updated_at": 0},
+    ),
+)
+
+PLAN_COMMAND_DEPS = PlanCommandDeps(
+    tr=tr,
+    set_menu_section=set_menu_section,
+    usage_report_text=usage_report_text,
+    stub_checkout_enabled=BILLING_STUB_CHECKOUT,
+    create_stub_checkout=_create_stub_purchase_checkout,
+)
+
+
+def _toolkit_quota_try(uid: int) -> tuple[bool, str]:
+    """Pre-flight quota check (does not consume). Handlers call ``_toolkit_quota_commit`` after success."""
+    lim = effective_toolkit_daily_limit(uid)
+    if lim <= 0:
+        return True, ""
+    cur = queue.toolkit_daily_get_count(uid)
+    if cur >= lim:
+        return False, tr(
+            uid,
+            "toolkit_quota_exceeded",
+            used=cur,
+            limit=lim,
+        )
+    return True, ""
+
+
+def _toolkit_quota_commit(uid: int) -> None:
+    """Count one successful toolkit invocation (atomic; skips if already at cap)."""
+    lim = effective_toolkit_daily_limit(uid)
+    if lim <= 0:
+        return
+    queue.toolkit_daily_increment_if_under_cap(uid, daily_limit=lim)
+
+
+TOOLKIT_COMMAND_DEPS = ToolkitCommandDeps(
+    tr=tr,
+    set_menu_section=set_menu_section,
+    toolkit_network_light_enabled=TOOLKIT_NETWORK_LIGHT,
+    toolkit_utility_light_enabled=TOOLKIT_UTILITY_LIGHT,
+    toolkit_quota_try=_toolkit_quota_try,
+    toolkit_quota_commit=_toolkit_quota_commit,
+)
+
+
 async def start_handler(client: Client, message: Message):
-    uid = message.from_user.id
-    remember_chat(message.chat.id)
-    await message.reply_text(
-        tr(uid, "welcome"),
-        reply_markup=build_main_menu(uid),
-    )
+    await handle_start(BASIC_COMMAND_DEPS, client, message)
 
 
-@app.on_message(filters.private & filters.command("menu"))
 async def menu_handler(client: Client, message: Message):
-    uid = message.from_user.id
-    await message.reply_text(
-        tr(uid, "menu_intro"),
-        reply_markup=build_main_menu(uid),
-    )
+    await handle_menu(BASIC_COMMAND_DEPS, client, message)
 
 
-@app.on_message(filters.private & filters.command("lang"))
 async def lang_handler(client: Client, message: Message):
-    uid = message.from_user.id
-    kb = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("فارسی", callback_data="setlang:fa"),
-                InlineKeyboardButton("English", callback_data="setlang:en"),
-            ],
-        ]
-    )
-    await message.reply_text(tr(uid, "pick_lang"), reply_markup=kb)
+    await handle_lang(BASIC_COMMAND_DEPS, client, message)
 
 
-@app.on_message(filters.private & filters.command("help"))
 async def help_handler(client: Client, message: Message):
-    uid = message.from_user.id
-    await message.reply_text(tr(uid, "help_short"))
+    await handle_help(BASIC_COMMAND_DEPS, client, message)
 
 
-@app.on_message(filters.private & filters.command("loghelp"))
 async def log_help_handler(client: Client, message: Message):
-    uid = message.from_user.id
-    await message.reply_text(tr(uid, "loghelp_body"))
+    await handle_log_help(BASIC_COMMAND_DEPS, client, message)
 
 
-@app.on_message(filters.private & filters.command("version"))
 async def version_handler(client: Client, message: Message):
-    uid = message.from_user.id
-    await message.reply_text(tr(uid, "version_line", version=APP_VERSION))
+    await handle_version(BASIC_COMMAND_DEPS, client, message)
 
 
-@app.on_message(filters.private & filters.command("rubika_status"))
 async def rubika_status_handler(client: Client, message: Message):
-    uid = message.from_user.id
-    session_name = get_user_session(uid)
-    if not session_name:
-        await message.reply_text(tr(uid, "rubika_not_connected"))
-        return
-    await message.reply_text(tr(uid, "rubika_checking"))
-    ok_session, details = await asyncio.to_thread(check_rubika_session_sync, session_name)
-    if ok_session:
-        await message.reply_text(tr(uid, "rubika_ok", session=session_name, details=details))
-    else:
-        await message.reply_text(
-            tr(uid, "rubika_invalid_session", session=session_name, details=details)
-        )
+    await handle_rubika_status(SESSION_SETTINGS_COMMAND_DEPS, client, message)
 
 
-@app.on_message(filters.private & filters.command("rubika_connect"))
 async def rubika_connect_handler(client: Client, message: Message):
-    user_id = message.from_user.id
-    current_session = get_user_session(user_id)
-    if current_session:
-        await message.reply_text(
-            tr(user_id, "rubika_already_connected", session=current_session)
-        )
-    set_state(user_id, {"step": "await_phone"})
-    log_event("rubika_connect_started", user_id=user_id)
-    await message.reply_text(tr(user_id, "rubika_ask_phone"))
+    await handle_rubika_connect(SESSION_SETTINGS_COMMAND_DEPS, client, message)
 
 
-@app.on_message(filters.private & filters.command("directmode"))
 async def direct_mode_handler(client: Client, message: Message):
-    uid = message.from_user.id
-    args = message.text.split(maxsplit=1)
-    if len(args) < 2:
-        await message.reply_text(tr(uid, "directmode_usage"))
-        return
-    action = args[1].strip().lower()
-    if action == "on":
-        set_direct_mode(uid, True)
-        await message.reply_text(tr(uid, "direct_on"), reply_markup=build_settings_menu(uid))
-        return
-    if action == "off":
-        set_direct_mode(uid, False)
-        await message.reply_text(
-            tr(uid, "direct_off"),
-            reply_markup=build_main_menu(uid),
-        )
-        return
-    await message.reply_text(tr(uid, "directmode_usage"))
+    await handle_direct_mode(SESSION_SETTINGS_COMMAND_DEPS, client, message)
 
 
-@app.on_message(filters.private & filters.command("netstatus"))
 async def netstatus_handler(client: Client, message: Message):
-    uid = message.from_user.id
-    data = load_json(NETWORK_FILE, {"mode": "unknown", "reason": "", "updated_at": 0})
-    mode = data.get("mode", "unknown")
-    reason = data.get("reason", "") or "---"
-    updated = data.get("updated_at", 0)
-    await message.reply_text(
-        tr(uid, "net_status", mode=mode, reason=reason, updated=updated),
-        parse_mode=None,
-    )
+    await handle_netstatus(SESSION_SETTINGS_COMMAND_DEPS, client, message)
 
 
 def failed_count() -> int:
@@ -1673,6 +1959,82 @@ def failed_count() -> int:
             return sum(1 for line in f if line.strip())
     except Exception:
         return 0
+
+
+def _run_admin_cleanup_downloads() -> tuple[int, int]:
+    n = 0
+    freed = 0
+    for p in DOWNLOAD_DIR.glob("*"):
+        try:
+            if p.is_file():
+                freed += p.stat().st_size
+                p.unlink()
+                n += 1
+        except OSError:
+            pass
+    return n, freed
+
+
+ADMIN_COMMAND_DEPS = AdminCommandDeps(
+    admin_ids=frozenset(ADMIN_IDS),
+    tr=tr,
+    set_menu_section=set_menu_section,
+    build_admin_menu=build_admin_menu,
+    load_network_snapshot=SESSION_SETTINGS_COMMAND_DEPS.load_network_snapshot,
+    queue_count=queue.queue_count,
+    queue_cancelled_count=queue.cancelled_count,
+    queue_deleted_count=queue.deleted_count,
+    failed_count=failed_count,
+    max_file_mb_display=max_file_mb_display,
+    admin_disk_report_text=admin_disk_report_text,
+    set_user_tier=set_user_tier,
+    add_bonus_month_mb=add_bonus_month_mb,
+    run_admin_cleanup_downloads=_run_admin_cleanup_downloads,
+    list_v2_payments_for_user=lambda uid, lim: queue.list_v2_payments_for_user(uid, limit=lim),
+    get_v2_payment_by_id=queue.get_v2_payment_by_id,
+    update_v2_payment_status=lambda pid, st, ref: queue.update_v2_payment_status(
+        pid, st, ref_id=ref
+    ),
+    maybe_grant_after_paid=lambda pid: maybe_grant_plan_after_paid(queue, pid),
+    run_billing_reconcile=lambda: run_reconcile(
+        queue,
+        pending_max_age_sec=BILLING_RECONCILE_PENDING_MAX_AGE_SEC,
+    ),
+    log_event=log_event,
+)
+
+QUEUE_COMMAND_DEPS = QueueCommandDeps(
+    tr=tr,
+    set_menu_section=set_menu_section,
+    enqueue_rubika_text_message=lambda message, text: enqueue_rubika_text_message(message, text),
+    extract_first_url=extract_first_url,
+    get_user_session=get_user_session,
+    queue_count_by_session=queue.queue_count_by_session,
+    processing_display_for_queue=processing_display_for_queue,
+    failed_count=failed_count,
+    queue_deleted_count=queue.deleted_count,
+    queue_cancelled_count=queue.cancelled_count,
+    queue_all_tasks=queue.all_tasks,
+    queue_remove_tasks_by_session=queue.remove_tasks_by_session,
+    mark_deleted=mark_deleted,
+)
+
+DELETE_COMMAND_DEPS = DeleteCommandDeps(
+    queue_all_tasks=queue.all_tasks,
+    queue_remove_task=queue.remove_task,
+    was_deleted=was_deleted,
+    cancel_job=cancel_job,
+    mark_deleted=mark_deleted,
+)
+
+BATCH_COMMAND_DEPS = BatchCommandDeps(
+    tr=tr,
+    set_batch=set_batch,
+    get_batch=get_batch,
+    set_menu_section=set_menu_section,
+    build_files_menu=build_files_menu,
+    set_state_preserving_menu=set_state_preserving_menu,
+)
 
 
 async def enqueue_rubika_text_message(message: Message, text_body: str) -> None:
@@ -1771,7 +2133,7 @@ async def queue_or_confirm(
             pass
         return
 
-    set_state(
+    set_state_preserving_menu(
         user_id,
         {
             "step": "await_send_confirm",
@@ -1816,65 +2178,83 @@ async def edit_wizard(chat_id: int, wizard_message_id: int, text: str):
         pass
 
 
-@app.on_message(filters.private & filters.command("admin"))
 async def admin_handler(client: Client, message: Message):
-    uid = message.from_user.id
-    if uid not in ADMIN_IDS:
-        await message.reply_text(tr(uid, "admin_denied"))
-        return
-    net = load_json(NETWORK_FILE, {"mode": "unknown", "reason": "", "updated_at": 0})
-    await message.reply_text(
-        tr(
-            uid,
-            "admin_panel",
-            qt=queue.queue_count(),
-            cancelled=queue.cancelled_count(),
-            deleted=queue.deleted_count(),
-            failed=failed_count(),
-            net_mode=net.get("mode", "unknown"),
-            net_reason=net.get("reason", "") or "---",
-        )
-        + "\n"
-        + tr(uid, "admin_max_file", mb=max_file_mb_display())
-        + "\n"
-        + tr(uid, "admin_plan_note")
-        + "\n\n"
-        + tr(uid, "rubika_update_hint")
-        + "\n\n"
-        + admin_disk_report_text(),
-        reply_markup=build_admin_menu(uid),
-        parse_mode=None,
-    )
+    await handle_admin_panel(ADMIN_COMMAND_DEPS, client, message)
 
 
-@app.on_message(filters.private & filters.command("usage"))
 async def usage_handler(client: Client, message: Message):
-    await message.reply_text(usage_report_text(message.from_user.id), parse_mode=None)
+    await handle_usage(PLAN_COMMAND_DEPS, client, message)
 
 
-@app.on_message(filters.private & filters.command("plan"))
 async def plan_handler(client: Client, message: Message):
-    uid = message.from_user.id
-    body = usage_report_text(uid) + "\n\n" + tr(uid, "purchase_info_body")
-    await message.reply_text(body, parse_mode=None)
+    await handle_plan(PLAN_COMMAND_DEPS, client, message)
 
 
-@app.on_message(filters.private & filters.command("purchase"))
 async def purchase_handler(client: Client, message: Message):
-    uid = message.from_user.id
-    await message.reply_text(tr(uid, "purchase_info_body"), parse_mode=None)
+    await handle_purchase(PLAN_COMMAND_DEPS, client, message)
 
 
-@app.on_message(filters.private & filters.command("admin_tier"))
+async def dns_lookup_handler(client: Client, message: Message):
+    await handle_dns_lookup(TOOLKIT_COMMAND_DEPS, client, message)
+
+
+async def my_ip_handler(client: Client, message: Message):
+    await handle_my_ip(TOOLKIT_COMMAND_DEPS, client, message)
+
+
+async def tcp_ping_handler(client: Client, message: Message):
+    await handle_tcp_ping(TOOLKIT_COMMAND_DEPS, client, message)
+
+
+async def md5_handler(client: Client, message: Message):
+    await handle_md5(TOOLKIT_COMMAND_DEPS, client, message)
+
+
+async def sha256_handler(client: Client, message: Message):
+    await handle_sha256(TOOLKIT_COMMAND_DEPS, client, message)
+
+
+async def b64_encode_handler(client: Client, message: Message):
+    await handle_b64_encode(TOOLKIT_COMMAND_DEPS, client, message)
+
+
+async def b64_decode_handler(client: Client, message: Message):
+    await handle_b64_decode(TOOLKIT_COMMAND_DEPS, client, message)
+
+
 async def admin_tier_handler(client: Client, message: Message):
+    await handle_admin_tier(ADMIN_COMMAND_DEPS, client, message)
+
+
+async def admin_bonus_handler(client: Client, message: Message):
+    await handle_admin_bonus(ADMIN_COMMAND_DEPS, client, message)
+
+
+async def cleanup_downloads_handler(client: Client, message: Message):
+    await handle_cleanup_downloads(ADMIN_COMMAND_DEPS, client, message)
+
+
+async def admin_payment_lookup_handler(client: Client, message: Message):
+    await handle_admin_payment_lookup(ADMIN_COMMAND_DEPS, client, message)
+
+
+async def admin_payment_status_handler(client: Client, message: Message):
+    await handle_admin_payment_status(ADMIN_COMMAND_DEPS, client, message)
+
+
+async def admin_reconcile_billing_handler(client: Client, message: Message):
+    await handle_admin_reconcile_billing(ADMIN_COMMAND_DEPS, client, message)
+
+
+async def admin_clear_prefs_handler(client: Client, message: Message):
     uid = message.from_user.id
     if uid not in ADMIN_IDS:
         await message.reply_text(tr(uid, "admin_denied"))
         return
     parts = (message.text or "").split()
-    if len(parts) < 3:
+    if len(parts) < 2:
         await message.reply_text(
-            "Usage: `/admin_tier <telegram_user_id> <guest|free|pro> [days_valid_for_pro]`",
+            "Usage: `/admin_clear_prefs <telegram_user_id>`",
             parse_mode=None,
         )
         return
@@ -1883,964 +2263,264 @@ async def admin_tier_handler(client: Client, message: Message):
     except ValueError:
         await message.reply_text("Invalid user id.", parse_mode=None)
         return
-    tier = parts[2].strip().lower()
-    exp = 0
-    if len(parts) >= 4:
-        try:
-            days = int(parts[3].strip())
-            if tier == "pro" and days > 0:
-                exp = int(time.time()) + days * 86400
-        except ValueError:
-            pass
-    set_user_tier(target, tier, exp)
-    await message.reply_text(
-        f"OK: user `{target}` tier=`{tier}` expires_at=`{exp}`",
-        parse_mode=None,
-    )
+    try:
+        queue.delete_v2_user_prefs(target)
+    except Exception as e:
+        log_event("admin_clear_prefs_failed", admin_id=uid, target=target, error=str(e))
+        await message.reply_text(f"DB error: {e}", parse_mode=None)
+        return
+    log_event("admin_clear_prefs_ok", admin_id=uid, target=target)
+    await message.reply_text(f"OK: cleared v2_user_prefs for `{target}`", parse_mode=None)
 
 
-@app.on_message(filters.private & filters.command("admin_bonus"))
-async def admin_bonus_handler(client: Client, message: Message):
+async def admin_clear_state_mirrors_handler(client: Client, message: Message):
     uid = message.from_user.id
     if uid not in ADMIN_IDS:
         await message.reply_text(tr(uid, "admin_denied"))
         return
     parts = (message.text or "").split()
-    if len(parts) < 3:
+    if len(parts) < 2:
         await message.reply_text(
-            "Usage: `/admin_bonus <telegram_user_id> <extra_month_mb>`",
+            "Usage: `/admin_clear_state_mirrors <telegram_user_id>`",
             parse_mode=None,
         )
         return
     try:
         target = int(parts[1].strip())
-        mb = int(parts[2].strip())
     except ValueError:
-        await message.reply_text("Invalid numbers.", parse_mode=None)
+        await message.reply_text("Invalid user id.", parse_mode=None)
         return
-    add_bonus_month_mb(target, mb)
-    await message.reply_text(f"OK: +{mb} MB monthly bonus for user `{target}`", parse_mode=None)
-
-
-@app.on_message(filters.private & filters.command("cleanup_downloads"))
-async def cleanup_downloads_handler(client: Client, message: Message):
-    uid = message.from_user.id
-    if uid not in ADMIN_IDS:
-        await message.reply_text(tr(uid, "admin_denied"))
+    try:
+        queue.delete_user_state_mirror(target)
+        queue.delete_batch_session_mirror(target)
+    except Exception as e:
+        log_event("admin_clear_state_mirrors_failed", admin_id=uid, target=target, error=str(e))
+        await message.reply_text(f"DB error: {e}", parse_mode=None)
         return
-    n = 0
-    freed = 0
-    for p in DOWNLOAD_DIR.glob("*"):
-        try:
-            if p.is_file():
-                freed += p.stat().st_size
-                p.unlink()
-                n += 1
-        except OSError:
-            pass
-    log_event("admin_cleanup_downloads", user_id=uid, files=n, bytes_freed=freed)
+    log_event("admin_clear_state_mirrors_ok", admin_id=uid, target=target)
     await message.reply_text(
-        tr(uid, "cleanup_done", n=n, mb=f"{freed / (1024 * 1024):.2f}"),
+        f"OK: cleared `v2_user_state_mirror` + `v2_batch_session_mirror` for `{target}` (JSON unchanged).",
         parse_mode=None,
     )
 
-@app.on_message(filters.private & filters.command("safemode"))
+
 async def safemode_handler(client: Client, message: Message):
-    global waiting_for_zip_password
-
-    args = message.text.split(maxsplit=1)
-
-    uid = message.from_user.id
-    if len(args) < 2:
-        await message.reply_text(tr(uid, "safemode_usage"))
-        return
-
-    action = args[1].strip().lower()
-    settings = load_settings()
-
-    if action == "on":
-        settings["safe_mode"] = True
-        save_settings(settings)
-        waiting_for_zip_password = True
-
-        await message.reply_text(tr(uid, "safemode_on"))
-        return
-
-    if action == "off":
-        settings["safe_mode"] = False
-        settings["zip_password"] = ""
-        save_settings(settings)
-        waiting_for_zip_password = False
-
-        await message.reply_text(tr(uid, "safemode_off"))
-        return
-
-    await message.reply_text(tr(uid, "safemode_bad"))
+    await handle_safemode(SAFEMODE_COMMAND_DEPS, client, message)
 
 
-@app.on_message(filters.private & filters.command("delall"))
 async def clear_queue_handler(client: Client, message: Message, acting_user_id: Optional[int] = None):
-    uid = acting_user_id if acting_user_id is not None else message.from_user.id
-    user_session = get_user_session(uid)
-    tasks = [t for t in queue.all_tasks() if t.get("rubika_session") == user_session]
+    await handle_clear_queue(QUEUE_COMMAND_DEPS, client, message, acting_user_id=acting_user_id)
 
-    tr_uid = uid
-    if not tasks:
-        await message.reply_text(tr(tr_uid, "queue_empty"))
-        return
-
-    for task in tasks:
-        mark_deleted(task)
-
-        old_path = task.get("path")
-        if old_path:
-            try:
-                path = Path(old_path)
-                if path.exists():
-                    path.unlink()
-            except Exception:
-                pass
-
-        try:
-            await client.edit_message_text(
-                chat_id=task["chat_id"],
-                message_id=task["status_message_id"],
-                text=tr(task.get("chat_id") or tr_uid, "removed_from_queue"),
-                parse_mode=None,
-            )
-        except MessageNotModified:
-            pass
-        except Exception:
-            pass
-
-    queue.remove_tasks_by_session(user_session)
-    await message.reply_text(tr(tr_uid, "queue_cleared_all"))
-
-@app.on_message(filters.private & filters.command("newbatch"))
 async def new_batch_handler(client: Client, message: Message):
-    set_batch(
-        message.from_user.id,
-        {
-            "active": True,
-            "files": [],
-            "created_at": int(time.time()),
-        },
-    )
-    uid = message.from_user.id
-    await message.reply_text(
-        tr(uid, "newbatch_ok"),
-        reply_markup=build_files_menu(uid),
-    )
+    await handle_new_batch(BATCH_COMMAND_DEPS, client, message)
 
 
-@app.on_message(filters.private & filters.command("done"))
 async def done_batch_handler(client: Client, message: Message):
-    batch = get_batch(message.from_user.id)
-    files = batch.get("files", [])
-    uid = message.from_user.id
-    if not batch.get("active") or not files:
-        await message.reply_text(tr(uid, "done_no_batch"))
-        return
-    wizard = await message.reply_text(tr(uid, "zip_name_prompt"))
-    set_state(
-        message.from_user.id,
-        {
-            "step": "await_zip_name",
-            "batch_files": files,
-            "wizard_message_id": wizard.id,
-            "wizard_chat_id": message.chat.id,
-        },
-    )
+    await handle_done_batch(BATCH_COMMAND_DEPS, client, message)
 
 
-@app.on_callback_query()
 async def callback_handler(client: Client, callback_query):
-    user_id = callback_query.from_user.id
-    data = callback_query.data or ""
-    state = get_state(user_id)
-
-    if data.startswith("setlang:"):
-        lang = data.split(":", 1)[1]
-        if lang in ("fa", "en"):
-            set_lang(user_id, lang)
-            await callback_query.answer(tr(user_id, "lang_saved"))
-            try:
-                await callback_query.message.edit_reply_markup(reply_markup=None)
-            except Exception:
-                pass
-            await callback_query.message.reply_text(
-                tr(user_id, "lang_saved"),
-                reply_markup=build_main_menu(user_id),
-            )
+    handled = await dispatch_callback_route(client, callback_query, CALLBACK_ROUTE_DEPS)
+    if handled:
         return
-
-    if data.startswith("queue:"):
-        action = data.split(":", 1)[1]
-        if action == "refresh":
-            await callback_query.answer(tr(user_id, "queue_kb_refresh"))
-            await queue_manage_handler(
-                client,
-                callback_query.message,
-                edit_existing=True,
-                target_user_id=user_id,
-            )
-            return
-        if action == "clearall":
-            await clear_queue_handler(client, callback_query.message, acting_user_id=user_id)
-            await callback_query.answer(tr(user_id, "queue_kb_cleared"))
-            return
-        if action == "pending":
-            session = get_user_session(user_id)
-            count = queue.queue_count_by_session(session or "")
-            await callback_query.answer(f"Pending: {count}", show_alert=True)
-            return
-        if action == "failed":
-            await callback_query.answer(f"Failed: {failed_count()}", show_alert=True)
-            return
-        if action == "faildetail":
-            await callback_query.answer()
-            sess = get_user_session(user_id)
-            body = recent_failed_detail_text(sess, limit=8)
-            title = tr(user_id, "failed_detail_title")
-            await callback_query.message.reply_text(
-                f"{title}\n\n{body}",
-                parse_mode=None,
-            )
-            return
-        if action == "history":
-            await callback_query.answer()
-            body = recent_jobs_summary(user_id)
-            title = tr(user_id, "recent_jobs_title")
-            await callback_query.message.reply_text(f"{title}\n\n{body}")
-            return
-
-    if data == "confirm_send" and state.get("step") == "await_send_confirm":
-        task = state.get("pending_task")
-        if not task:
-            await callback_query.answer("Pending task not found", show_alert=True)
-            return
-        if not await gate_quota(callback_query.message, user_id, task):
-            await callback_query.answer("Quota", show_alert=True)
-            return
-        anchor = callback_query.message
-        task["chat_id"] = anchor.chat.id
-        task["status_message_id"] = anchor.id
-        task = queue.push_task(task)
-        qpos = queue.queue_count_by_session(task.get("rubika_session") or "")
-        clear_state(user_id)
-        log_event(
-            "task_queued",
-            user_id=user_id,
-            job_id=task.get("job_id"),
-            task_type=task.get("type"),
-            direct_mode=False,
-        )
-        try:
-            await anchor.edit_text(
-                tr(user_id, "text_queued", job_id=task["job_id"], qpos=qpos),
-                reply_markup=None,
-                parse_mode=None,
-            )
-        except MessageNotModified:
-            pass
-        await callback_query.answer("Queued")
-        return
-
-    if data == "cancel_send" and state.get("step") == "await_send_confirm":
-        clear_state(user_id)
-        log_event("task_confirm_cancelled", user_id=user_id)
-        try:
-            await callback_query.message.edit_text(
-                tr(user_id, "confirm_cancelled"),
-                reply_markup=None,
-                parse_mode=None,
-            )
-        except Exception:
-            await callback_query.message.reply_text(tr(user_id, "confirm_cancelled"))
-        await callback_query.answer("Canceled")
-        return
-
     await callback_query.answer("این گزینه منقضی شده یا معتبر نیست.", show_alert=True)
 
 
-@app.on_message(filters.private & filters.command("sendtext"))
 async def send_text_handler(client: Client, message: Message):
-    uid = message.from_user.id
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await message.reply_text(tr(uid, "sendtext_usage"))
-        return
-    await enqueue_rubika_text_message(message, parts[1])
+    await handle_send_text(QUEUE_COMMAND_DEPS, client, message)
 
 
-@app.on_message(filters.private & filters.command("sendlink"))
 async def send_link_handler(client: Client, message: Message):
-    uid = message.from_user.id
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await message.reply_text(tr(uid, "sendlink_usage"))
-        return
-    url = extract_first_url(parts[1])
-    if not url:
-        await message.reply_text(tr(uid, "invalid_link"))
-        return
-    await enqueue_rubika_text_message(message, url)
+    await handle_send_link(QUEUE_COMMAND_DEPS, client, message)
 
 
-@app.on_message(filters.private & filters.command("queue"))
 async def queue_manage_handler(
     client: Client,
     message: Message,
     edit_existing: bool = False,
     target_user_id: Optional[int] = None,
 ):
-    user_id = target_user_id if target_user_id is not None else message.from_user.id
-    session = get_user_session(user_id)
-    pending = queue.queue_count_by_session(session or "")
-    proc = processing_display_for_queue(user_id)
-    summary = tr(
-        user_id,
-        "queue_panel",
-        pending=pending,
-        processing=proc,
-        failed=failed_count(),
-        deleted=queue.deleted_count(),
-        cancelled=queue.cancelled_count(),
+    await handle_queue_manage(
+        QUEUE_COMMAND_DEPS,
+        client,
+        message,
+        edit_existing=edit_existing,
+        target_user_id=target_user_id,
     )
-    kb = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton(tr(user_id, "btn_inline_refresh"), callback_data="queue:refresh")],
-            [
-                InlineKeyboardButton(tr(user_id, "btn_inline_pending"), callback_data="queue:pending"),
-                InlineKeyboardButton(tr(user_id, "btn_inline_failed"), callback_data="queue:failed"),
-            ],
-            [InlineKeyboardButton(tr(user_id, "btn_inline_recent"), callback_data="queue:history")],
-            [InlineKeyboardButton(tr(user_id, "btn_inline_faildetail"), callback_data="queue:faildetail")],
-            [InlineKeyboardButton(tr(user_id, "btn_inline_clear"), callback_data="queue:clearall")],
-        ]
-    )
-    if edit_existing:
-        try:
-            await message.edit_text(summary, reply_markup=kb, parse_mode=None)
-            return
-        except MessageNotModified:
-            return
-        except Exception:
-            pass
-    await message.reply_text(summary, reply_markup=kb, parse_mode=None)
 
 
-@app.on_message(filters.private & filters.command("del"))
 async def delete_one_handler(client: Client, message: Message):
-    job_id = None
-    reply_message_id = None
-
-    parts = message.text.split(maxsplit=1)
-    if len(parts) > 1:
-        job_id = parts[1].strip()
-
-    if message.reply_to_message:
-        reply_message_id = message.reply_to_message.id
-
-    tasks = queue.all_tasks()
-
-    if not tasks:
-        if job_id and was_deleted(job_id=job_id):
-            await message.reply_text("این مورد قبلاً از صف حذف شده است.")
-            return
-
-        if reply_message_id and was_deleted(message_id=reply_message_id):
-            await message.reply_text("این مورد قبلاً از صف حذف شده است.")
-            return
-
-        if job_id:
-            cancel_job(job_id)
-            await message.reply_text(
-                "لغو ثبت شد.\n\n"
-            )
-            return
-
-        await message.reply_text("موردی برای حذف در صف پیدا نشد.")
-        return
-
-    removed = queue.remove_task(job_id=job_id, message_id=reply_message_id)
-
-    if removed:
-        mark_deleted(removed)
-
-        old_path = removed.get("path")
-        if old_path:
-            try:
-                path = Path(old_path)
-                if path.exists():
-                    path.unlink()
-            except Exception:
-                pass
-
-        try:
-            await client.edit_message_text(
-                chat_id=removed["chat_id"],
-                message_id=removed["status_message_id"],
-                text="این مورد از صف حذف شد."
-            )
-        except Exception:
-            pass
-
-        await message.reply_text("از صف حذف شد.")
-        return
-
-    if job_id and was_deleted(job_id=job_id):
-        await message.reply_text("این مورد قبلاً از صف حذف شده است.")
-        return
-
-    if reply_message_id and was_deleted(message_id=reply_message_id):
-        await message.reply_text("این مورد قبلاً از صف حذف شده است.")
-        return
-
-    if job_id:
-        cancel_job(job_id)
-        await message.reply_text("دستور لغو ثبت شد.") 
-        return
+    await handle_delete_one(DELETE_COMMAND_DEPS, client, message)
 
 
-@app.on_message(filters.private & filters.text & ~filters.command(["start", "menu", "lang", "help", "loghelp", "version", "rubika_status", "rubika_connect", "directmode", "netstatus", "admin", "safemode", "del", "delall", "newbatch", "done", "sendtext", "sendlink", "queue", "usage", "plan", "purchase", "admin_tier", "admin_bonus"]))
-async def text_handler(client: Client, message: Message):
+def _zip_password_waiting() -> bool:
     global waiting_for_zip_password
+    return waiting_for_zip_password
 
-    text = message.text or ""
-    user_id = message.from_user.id
-    state = get_state(user_id)
 
-    if text.strip() == tr(user_id, "btn_main_plan_section"):
-        await message.reply_text(
-            tr(user_id, "plan_menu_opened"),
-            reply_markup=build_plan_menu(user_id),
-        )
-        return
+def _set_zip_password_waiting(v: bool) -> None:
+    global waiting_for_zip_password
+    waiting_for_zip_password = v
 
-    button_map = {
-        "menu": "/menu",
-        "منو": "/menu",
-        "help": "/help",
-        "راهنما": "/help",
-        "راهنمای لاگ": "/loghelp",
-        "back to main menu": "/menu",
-        "بازگشت به منوی اصلی": "/menu",
-        "rubika menu": "/show_rubika_menu",
-        "منوی اتصال": "/show_rubika_menu",
-        "files menu": "/show_files_menu",
-        "منوی فایل‌ها": "/show_files_menu",
-        "zip files start": "/newbatch",
-        "شروع فایل zip": "/newbatch",
-        "zip files done": "/done",
-        "پایان فایل zip": "/done",
-        "settings menu": "/show_settings_menu",
-        "منوی تنظیمات": "/show_settings_menu",
-        "admin menu": "/show_admin_menu",
-        "منوی ادمین": "/show_admin_menu",
-        "rubika connect": "/rubika_connect",
-        "اتصال روبیکا": "/rubika_connect",
-        "rubika status": "/rubika_status",
-        "وضعیت روبیکا": "/rubika_status",
-        "new batch": "/newbatch",
-        "شروع بچ": "/newbatch",
-        "شروع بچ فایل zip": "/newbatch",
-        "done batch": "/done",
-        "پایان بچ": "/done",
-        "پایان بچ فایل zip": "/done",
-        "send text or link": "/quick_send_prompt",
-        "ارسال متن یا لینک": "/quick_send_prompt",
-        "send text": "/quick_send_prompt",
-        "ارسال متن": "/quick_send_prompt",
-        "send link": "/quick_send_prompt",
-        "ارسال لینک": "/quick_send_prompt",
-        "delete all": "/delall",
-        "حذف همه": "/delall",
-        "queue management": "/queue",
-        "مدیریت صف": "/queue",
-        "network status": "/netstatus",
-        "وضعیت شبکه": "/netstatus",
-        "admin panel": "/admin",
-        "پنل ادمین": "/admin",
-        "direct mode on": "/directmode on",
-        "حالت مستقیم روشن": "/directmode on",
-        "direct mode off": "/directmode off",
-        "حالت مستقیم خاموش": "/directmode off",
-        "connection menu": "/show_rubika_menu",
-        "start zip": "/newbatch",
-        "end zip": "/done",
-        "main menu": "/menu",
-        "queue": "/queue",
-    }
-    mapped = button_map.get(text.strip().lower())
-    if mapped == "/menu":
-        await menu_handler(client, message)
-        return
-    if mapped == "/help":
-        await help_handler(client, message)
-        return
-    if mapped == "/loghelp":
-        await log_help_handler(client, message)
-        return
-    if mapped == "/show_rubika_menu":
-        await message.reply_text(tr(user_id, "rubika_menu_title"), reply_markup=build_rubika_menu(user_id))
-        return
-    if mapped == "/show_files_menu":
-        await message.reply_text(tr(user_id, "files_menu_title"), reply_markup=build_files_menu(user_id))
-        return
-    if mapped == "/show_settings_menu":
-        await message.reply_text(tr(user_id, "settings_menu_title"), reply_markup=build_settings_menu(user_id))
-        return
-    if mapped == "/show_admin_menu":
-        if user_id in ADMIN_IDS:
-            await message.reply_text(tr(user_id, "admin_menu_title"), reply_markup=build_admin_menu(user_id))
-        else:
-            await message.reply_text(tr(user_id, "admin_denied"))
-        return
-    if mapped == "/rubika_connect":
-        await rubika_connect_handler(client, message)
-        return
-    if mapped == "/rubika_status":
-        await rubika_status_handler(client, message)
-        return
-    if mapped == "/newbatch":
-        await new_batch_handler(client, message)
-        return
-    if mapped == "/done":
-        await done_batch_handler(client, message)
-        return
-    if mapped == "/delall":
-        await clear_queue_handler(client, message)
-        return
-    if mapped == "/queue":
-        await queue_manage_handler(client, message)
-        return
-    if mapped == "/netstatus":
-        await netstatus_handler(client, message)
-        return
-    if mapped == "/admin":
-        await admin_handler(client, message)
-        return
-    if mapped == "/directmode on":
-        message.text = "/directmode on"
-        await direct_mode_handler(client, message)
-        return
-    if mapped == "/directmode off":
-        message.text = "/directmode off"
-        await direct_mode_handler(client, message)
-        return
-    if mapped == "/quick_send_prompt":
-        set_state(user_id, {"step": "await_quick_message"})
-        await message.reply_text(tr(user_id, "prompt_quick_message"))
-        return
 
-    if state.get("step") == "await_quick_message":
-        clear_state(user_id)
-        await enqueue_rubika_text_message(message, text)
-        return
+REPLY_ROUTE_DEPS = ReplyRouteDeps(
+    admin_ids=frozenset(ADMIN_IDS),
+    tr=tr,
+    set_menu_section=set_menu_section,
+    set_state_preserving_menu=set_state_preserving_menu,
+    menu_handler=menu_handler,
+    help_handler=help_handler,
+    log_help_handler=log_help_handler,
+    rubika_connect_handler=rubika_connect_handler,
+    rubika_status_handler=rubika_status_handler,
+    new_batch_handler=new_batch_handler,
+    done_batch_handler=done_batch_handler,
+    clear_queue_handler=clear_queue_handler,
+    queue_manage_handler=queue_manage_handler,
+    netstatus_handler=netstatus_handler,
+    admin_handler=admin_handler,
+    direct_mode_handler=direct_mode_handler,
+    build_rubika_menu=build_rubika_menu,
+    build_files_menu=build_files_menu,
+    build_settings_menu=build_settings_menu,
+    build_admin_menu=build_admin_menu,
+)
 
-    if state.get("step") == "await_phone":
-        phone = text.strip().replace("+", "")
-        session_name = f"rubika_{user_id}"
-        try:
-            result = await rubika_send_code(session_name, phone)
-            phone_hash = _deep_find_phone_hash(result)
-            status = _deep_find_status(result).upper()
-            if status == "SENDPASSKEY":
-                set_state(
-                    user_id,
-                    {
-                        "step": "await_pass_key",
-                        "session_name": session_name,
-                        "phone_number": phone,
-                    },
-                )
-                await message.reply_text(tr(user_id, "rubika_passkey_needed"))
-                return
-            if not phone_hash:
-                raise RuntimeError(f"phone_code_hash پیدا نشد. status={status or 'unknown'}")
-            set_state(
-                user_id,
-                {
-                    "step": "await_code",
-                    "session_name": session_name,
-                    "phone_number": phone,
-                    "phone_code_hash": phone_hash,
-                },
-            )
-            await message.reply_text(tr(user_id, "rubika_code_sent"))
-        except Exception as e:
-            clear_state(user_id)
-            await message.reply_text(tr(user_id, "rubika_send_code_error", error=str(e)))
-        return
+RUBIKA_WIZARD_DEPS = RubikaWizardDeps(
+    tr=tr,
+    set_state_preserving_menu=set_state_preserving_menu,
+    clear_state=clear_state,
+    get_user_key=get_user_key,
+    load_users=load_users,
+    save_users=save_users,
+    log_event=log_event,
+    persist_rubika_session=_persist_rubika_session_prefs,
+    rubika_send_code=rubika_send_code,
+    rubika_sign_in=rubika_sign_in,
+    deep_find_phone_hash=_deep_find_phone_hash,
+    deep_find_status=_deep_find_status,
+)
 
-    if state.get("step") == "await_pass_key":
-        pass_key = text.strip()
-        session_name = state.get("session_name", "")
-        phone_number = state.get("phone_number", "")
-        try:
-            result = await rubika_send_code(session_name, phone_number, pass_key=pass_key)
-            phone_hash = _deep_find_phone_hash(result)
-            status = _deep_find_status(result).upper()
-            if not phone_hash:
-                raise RuntimeError(f"phone_code_hash پیدا نشد. status={status or 'unknown'}")
-            set_state(
-                user_id,
-                {
-                    "step": "await_code",
-                    "session_name": session_name,
-                    "phone_number": phone_number,
-                    "phone_code_hash": phone_hash,
-                },
-            )
-            await message.reply_text(tr(user_id, "rubika_code_sent"))
-        except Exception as e:
-            clear_state(user_id)
-            await message.reply_text(tr(user_id, "rubika_send_code_error", error=str(e)))
-        return
+ZIP_BATCH_WIZARD_DEPS = ZipBatchWizardDeps(
+    tr=tr,
+    safe_filename=safe_filename,
+    safe_delete_user_message=safe_delete_user_message,
+    edit_wizard=edit_wizard,
+    set_state_preserving_menu=set_state_preserving_menu,
+    clear_state=clear_state,
+    clear_batch=clear_batch,
+    load_settings=load_settings,
+    make_bundle_zip_local=make_bundle_zip_local,
+    effective_max_file_bytes=effective_max_file_bytes,
+    effective_max_mb_display=effective_max_mb_display,
+    fmt_mb_bytes=fmt_mb_bytes,
+    gate_quota=gate_quota,
+    get_user_session=get_user_session,
+    pretty_size=pretty_size,
+    queue_or_confirm=queue_or_confirm,
+)
 
-    if state.get("step") == "await_code":
-        code = text.strip()
-        session_name = state.get("session_name", "")
-        phone_number = state.get("phone_number", "")
-        phone_code_hash = state.get("phone_code_hash", "")
-        try:
-            await rubika_sign_in(session_name, phone_number, phone_code_hash, code)
-            users = load_users()
-            key = get_user_key(user_id)
-            prev = users.get(key, {})
-            users[key] = {
-                **prev,
-                "connected": True,
-                "session": session_name,
-                "phone_number": phone_number,
-                "connected_at": int(time.time()),
-            }
-            save_users(users)
-            clear_state(user_id)
-            await message.reply_text(tr(user_id, "rubika_connected_ok"))
-            log_event("rubika_connect_ok", user_id=user_id, session=session_name)
-        except Exception as e:
-            clear_state(user_id)
-            log_event("rubika_connect_failed", user_id=user_id, error=str(e))
-            await message.reply_text(tr(user_id, "rubika_bad_code", error=str(e)))
-        return
+ZIP_PASSWORD_DEPS = ZipPasswordPromptDeps(
+    get_waiting_for_password=_zip_password_waiting,
+    set_waiting_for_password=_set_zip_password_waiting,
+    tr=tr,
+    load_settings=load_settings,
+    save_settings=save_settings,
+)
 
-    if state.get("step") == "await_zip_name":
-        zip_name = safe_filename(text.strip() or "bundle")
-        await safe_delete_user_message(message)
-        bf = state.get("batch_files", [])
-        fps = [Path(p) for p in bf if Path(p).exists()]
-        raw_sum = sum(p.stat().st_size for p in fps)
-        prompt_body = (
-            tr(user_id, "part_mb_prompt")
-            + "\n\n"
-            + tr(user_id, "batch_raw_hint", raw_mb=fmt_mb_bytes(raw_sum), n=len(fps))
-        )
-        await edit_wizard(
-            state.get("wizard_chat_id", message.chat.id),
-            int(state.get("wizard_message_id", 0) or 0),
-            prompt_body,
-        )
-        set_state(
-            user_id,
-            {
-                "step": "await_part_mb",
-                "zip_name": zip_name,
-                "batch_files": state.get("batch_files", []),
-                "wizard_message_id": state.get("wizard_message_id"),
-                "wizard_chat_id": state.get("wizard_chat_id"),
-            },
-        )
-        return
+SAFEMODE_COMMAND_DEPS = SafeModeCommandDeps(
+    tr=tr,
+    load_settings=load_settings,
+    save_settings=save_settings,
+    set_waiting_for_zip_password=_set_zip_password_waiting,
+)
 
-    if state.get("step") == "await_part_mb":
-        try:
-            part_mb = int(text.strip())
-        except Exception:
-            await message.reply_text(tr(user_id, "part_mb_invalid"))
-            return
-        if part_mb < 50:
-            await message.reply_text(tr(user_id, "part_mb_min"))
-            return
-        await safe_delete_user_message(message)
-        files = state.get("batch_files", [])
-        session_name = get_user_session(user_id)
-        file_paths = [Path(p) for p in files if Path(p).exists()]
-        if not file_paths:
-            await message.reply_text(tr(user_id, "zip_no_files"))
-            clear_state(user_id)
-            clear_batch(user_id)
-            return
-        settings = load_settings()
-        zip_password = settings.get("zip_password", "") if settings.get("safe_mode", False) else ""
-        zip_path = make_bundle_zip_local(file_paths, state.get("zip_name", "bundle"), zip_password)
-        total_size = sum(p.stat().st_size for p in file_paths if p.exists())
-        zip_sz = zip_path.stat().st_size
-        lim_b = effective_max_file_bytes(user_id)
-        if lim_b is not None and zip_sz > lim_b:
-            try:
-                zip_path.unlink()
-            except Exception:
-                pass
-            await message.reply_text(
-                tr(
-                    user_id,
-                    "file_too_large",
-                    max_mb=effective_max_mb_display(user_id),
-                    size_mb=fmt_mb_bytes(zip_sz),
-                ),
-                parse_mode=None,
-            )
-            clear_state(user_id)
-            clear_batch(user_id)
-            return
-        qt = {"type": "local_file", "file_size": zip_sz, "rubika_session": session_name}
-        if not await gate_quota(message, user_id, qt):
-            try:
-                zip_path.unlink()
-            except Exception:
-                pass
-            clear_state(user_id)
-            clear_batch(user_id)
-            return
-        if zip_sz > 45 * 1024 * 1024:
-            await message.reply_text(tr(user_id, "zip_large_warn"))
-        for p in file_paths:
-            try:
-                p.unlink()
-            except Exception:
-                pass
-        zip_status_msg = None
-        try:
-            zip_status_msg = await message.reply_document(
-                str(zip_path),
-                caption=tr(
-                    user_id,
-                    "zip_ready_caption",
-                    n=len(file_paths),
-                    insize=pretty_size(total_size),
-                    zsize=pretty_size(zip_sz),
-                ),
-            )
-        except Exception:
-            zip_status_msg = await message.reply_text(
-                tr(
-                    user_id,
-                    "zip_ready_no_doc",
-                    n=len(file_paths),
-                    insize=pretty_size(total_size),
-                    zsize=pretty_size(zip_sz),
-                )
-            )
-        task = {
-            "type": "local_file",
-            "path": str(zip_path),
-            "file_name": zip_path.name,
-            "file_size": zip_sz,
-            "part_size_mb": part_mb,
-            "rubika_session": session_name,
-            "safe_mode": False,
-            "zip_password": "",
-            "telegram_user_id": user_id,
-        }
-        clear_state(user_id)
-        clear_batch(user_id)
-        await queue_or_confirm(
-            message,
-            task,
-            tr(user_id, "zip_queue_summary", name=zip_path.name),
-            status_message=zip_status_msg,
-        )
-        return
+CALLBACK_ROUTE_DEPS = CallbackRouteDeps(
+    tr=tr,
+    get_state=get_state,
+    set_lang=set_lang,
+    set_menu_section_main=lambda user_id: set_menu_section(user_id, MenuSection.MAIN),
+    build_main_menu=build_main_menu,
+    queue_manage_handler=queue_manage_handler,
+    clear_queue_handler=clear_queue_handler,
+    get_user_session=get_user_session,
+    queue_count_by_session=queue.queue_count_by_session,
+    failed_count=failed_count,
+    recent_failed_detail_text=recent_failed_detail_text,
+    recent_jobs_summary=recent_jobs_summary,
+    gate_quota=gate_quota,
+    queue_push_task=queue.push_task,
+    clear_state=clear_state,
+    log_event=log_event,
+)
 
-    if waiting_for_zip_password:
-        password = text.strip()
+DIRECT_MODE_TEXT_DEPS = DirectModeTextDeps(
+    tr=tr,
+    is_direct_mode=is_direct_mode,
+    get_user_session=get_user_session,
+    gate_quota=gate_quota,
+    push_task=queue.push_task,
+    queue_count_by_session=queue.queue_count_by_session,
+    log_event=log_event,
+)
 
-        if not password:
-            await message.reply_text(tr(user_id, "password_empty"))
-            return
+DIRECT_URL_HINT_DEPS = DirectUrlHintDeps(
+    tr=tr,
+    extract_first_url=extract_first_url,
+    is_direct_url=is_direct_url,
+)
 
-        settings = load_settings()
-        settings["safe_mode"] = True
-        settings["zip_password"] = password
-        save_settings(settings)
+TEXT_ENTRY_DEPS = TextEntryDeps(
+    tr=tr,
+    get_state=get_state,
+    set_menu_section=set_menu_section,
+    build_plan_menu=build_plan_menu,
+    resolve_reply_button_route=menu_engine.resolve_reply_button_route,
+    dispatch_reply_keyboard_route=dispatch_reply_keyboard_route,
+    reply_route_deps=REPLY_ROUTE_DEPS,
+    clear_state=clear_state,
+    enqueue_rubika_text_message=enqueue_rubika_text_message,
+    dispatch_rubika_connect_wizard=dispatch_rubika_connect_wizard,
+    rubika_wizard_deps=RUBIKA_WIZARD_DEPS,
+    dispatch_zip_batch_wizard=dispatch_zip_batch_wizard,
+    zip_batch_wizard_deps=ZIP_BATCH_WIZARD_DEPS,
+    handle_zip_password_text=handle_zip_password_text,
+    zip_password_deps=ZIP_PASSWORD_DEPS,
+    handle_direct_mode_plain_text=handle_direct_mode_plain_text,
+    direct_mode_text_deps=DIRECT_MODE_TEXT_DEPS,
+    handle_direct_url_sendlink_hint=handle_direct_url_sendlink_hint,
+    direct_url_hint_deps=DIRECT_URL_HINT_DEPS,
+)
 
-        waiting_for_zip_password = False
+MEDIA_HANDLER_DEPS = MediaHandlerDeps(
+    tr=tr,
+    get_user_session=get_user_session,
+    get_media=get_media,
+    build_download_filename=build_download_filename,
+    download_dir=DOWNLOAD_DIR,
+    download_progress=download_progress,
+    effective_max_file_bytes=effective_max_file_bytes,
+    effective_max_mb_display=effective_max_mb_display,
+    fmt_mb_bytes=fmt_mb_bytes,
+    load_settings=load_settings,
+    get_batch=get_batch,
+    set_batch=set_batch,
+    pretty_size=pretty_size,
+    queue_or_confirm=queue_or_confirm,
+    log_event=log_event,
+)
 
-        await message.reply_text(tr(user_id, "password_saved_zip"))
-        return
 
-    if is_direct_mode(user_id):
-        session_name = get_user_session(user_id)
-        if not session_name:
-            await message.reply_text(tr(user_id, "direct_need_rubika"))
-            return
-        task = {
-            "type": "text_message",
-            "text": text,
-            "rubika_session": session_name,
-        }
-        if not await gate_quota(message, user_id, task):
-            return
-        status = await message.reply_text(tr(user_id, "text_queueing"))
-        task["chat_id"] = message.chat.id
-        task["status_message_id"] = status.id
-        pushed = queue.push_task(task)
-        qpos = queue.queue_count_by_session(session_name)
-        log_event(
-            "task_queued",
-            user_id=user_id,
-            job_id=pushed.get("job_id"),
-            task_type="text_message",
-            direct_mode=True,
-        )
-        try:
-            await status.edit_text(
-                tr(user_id, "text_queued", job_id=pushed["job_id"], qpos=qpos),
-                parse_mode=None,
-            )
-        except MessageNotModified:
-            pass
-        return
-
-    url = extract_first_url(text)
-
-    if not url or not is_direct_url(url):
-        return
-    await message.reply_text(tr(user_id, "direct_url_use_sendlink"), parse_mode=None)
+async def text_handler(client: Client, message: Message):
+    await handle_text_entry(TEXT_ENTRY_DEPS, client, message)
 
     
-@app.on_message(
-    filters.private
-    & (
-        filters.document
-        | filters.video
-        | filters.audio
-        | filters.voice
-        | filters.photo
-        | filters.animation
-        | filters.video_note
-        | filters.sticker
-    )
-)
 async def media_handler(client: Client, message: Message):
-    user_id = message.from_user.id
-    session_name = get_user_session(user_id)
-    if not session_name:
-        await message.reply_text(tr(user_id, "media_need_rubika"))
-        return
+    await handle_media_message(MEDIA_HANDLER_DEPS, client, message)
 
-    media_type, media = get_media(message)
-    if not media:
-        await message.reply_text(tr(user_id, "media_bad_type"))
-        return
 
-    download_name = build_download_filename(message, media_type, media)
-    download_path = DOWNLOAD_DIR / download_name
+register_handlers(app)
 
-    status = await message.reply_text(tr(user_id, "media_download_status"))
-
-    try:
-        started_at = time.time()
-        progress_state = {"last_update": 0, "user_id": user_id}
-
-        downloaded = await client.download_media(
-            message,
-            file_name=str(download_path),
-            progress=download_progress,
-            progress_args=(status, download_name, started_at, progress_state),
-        )
-
-        if not downloaded:
-            raise RuntimeError("Download failed.")
-
-        downloaded_path = Path(downloaded)
-        if not downloaded_path.exists():
-            raise RuntimeError("Downloaded file not found.")
-
-        file_size = downloaded_path.stat().st_size
-        lim_b = effective_max_file_bytes(user_id)
-        if lim_b is not None and file_size > lim_b:
-            try:
-                downloaded_path.unlink()
-            except Exception:
-                pass
-            await status.edit_text(
-                tr(
-                    user_id,
-                    "file_too_large",
-                    max_mb=effective_max_mb_display(user_id),
-                    size_mb=fmt_mb_bytes(file_size),
-                ),
-                parse_mode=None,
-            )
-            return
-        settings = load_settings()
-        batch = get_batch(user_id)
-
-        if batch.get("active"):
-            files = batch.get("files", [])
-            files.append(str(downloaded_path))
-            batch["files"] = files
-            set_batch(user_id, batch)
-            raw_tot = 0
-            for pstr in files:
-                try:
-                    pp = Path(pstr)
-                    if pp.exists():
-                        raw_tot += pp.stat().st_size
-                except OSError:
-                    pass
-            await status.edit_text(
-                tr(
-                    user_id,
-                    "media_zip_added",
-                    n=len(files),
-                    raw_mb=fmt_mb_bytes(raw_tot),
-                ),
-                parse_mode=None,
-            )
-            return
-
-        task = {
-            "type": "local_file",
-            "path": str(downloaded_path),
-            "caption": message.caption or "",
-            "file_name": download_name,
-            "file_size": file_size,
-            "safe_mode": settings.get("safe_mode", False),
-            "zip_password": settings.get("zip_password", ""),
-            "rubika_session": session_name,
-            "telegram_user_id": user_id,
-        }
-
-        await status.edit_text(
-            tr(
-                user_id,
-                "media_file_ready",
-                name=download_name,
-                size=pretty_size(file_size),
-            ),
-            parse_mode=None,
-        )
-        await queue_or_confirm(
-            message,
-            task,
-            tr(user_id, "file_prepared_summary", name=download_name),
-            status_message=status,
-        )
-        log_event(
-            "media_prepared",
-            user_id=user_id,
-            file_name=download_name,
-            file_size=file_size,
-            task_type="local_file",
-        )
-
-    except Exception as e:
-        log_event("media_prepare_failed", user_id=user_id, error=str(e))
-        await status.edit_text(tr(user_id, "media_error", error=str(e)), parse_mode=None)
 
 def clear_old_status():
     try:
@@ -2850,9 +2530,6 @@ def clear_old_status():
         pass
 
 if __name__ == "__main__":
-    clear_old_status()
-    app.start()
-    app.loop.create_task(status_watcher())
-    app.loop.create_task(maybe_broadcast_update())
-    idle()
-    app.stop()
+    from v2.bot.startup import run_bot
+
+    run_bot()

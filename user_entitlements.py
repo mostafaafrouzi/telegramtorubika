@@ -36,18 +36,21 @@ TIER_LIMITS: dict[str, dict[str, int]] = {
         "quota_month_mb": 500,
         "max_file_mb": 50,
         "max_parallel": 1,
+        "toolkit_daily_cmds": 25,
     },
     "free": {
         "quota_day_mb": 500,
         "quota_month_mb": 5000,
         "max_file_mb": 500,
         "max_parallel": 2,
+        "toolkit_daily_cmds": 0,
     },
     "pro": {
         "quota_day_mb": 5000,
         "quota_month_mb": 50000,
         "max_file_mb": 2048,
         "max_parallel": 5,
+        "toolkit_daily_cmds": 0,
     },
 }
 
@@ -59,6 +62,7 @@ class ResolvedLimits:
     quota_month_mb: int
     max_file_mb: int
     max_parallel: int
+    toolkit_daily_cmds: int
     expires_at: int
 
 
@@ -168,8 +172,33 @@ def resolved_limits(user_id: int) -> ResolvedLimits:
         quota_month_mb=base["quota_month_mb"] + max(0, bonus),
         max_file_mb=base["max_file_mb"],
         max_parallel=base["max_parallel"],
+        toolkit_daily_cmds=int(base.get("toolkit_daily_cmds", 0)),
         expires_at=exp,
     )
+
+
+def _parse_toolkit_daily_env_cap() -> int:
+    try:
+        return int((os.getenv("TOOLKIT_DAILY_LIMIT_PER_USER") or "0").strip())
+    except ValueError:
+        return 0
+
+
+def effective_toolkit_daily_limit(user_id: int) -> int:
+    """Max toolkit command invocations per UTC day. 0 = unlimited.
+
+    Uses per-tier ``toolkit_daily_cmds`` (0 in tier = unlimited). Optional env
+    ``TOOLKIT_DAILY_LIMIT_PER_USER`` (when > 0) applies as a hard ceiling for all tiers.
+    """
+    if DISABLE_USAGE_LIMITS:
+        return 0
+    tier_cap = int(resolved_limits(user_id).toolkit_daily_cmds)
+    env_cap = _parse_toolkit_daily_env_cap()
+    if env_cap > 0:
+        if tier_cap <= 0:
+            return env_cap
+        return min(tier_cap, env_cap)
+    return tier_cap
 
 
 def get_usage_snapshot(user_id: int) -> dict[str, Any]:

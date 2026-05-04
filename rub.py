@@ -28,6 +28,14 @@ ENABLE_UPLOAD_CHECKSUM = os.getenv("ENABLE_UPLOAD_CHECKSUM", "").strip().lower()
     "yes",
 )
 
+# v2 transfer: optional Rubika session pre-check via ``v2.transfer.integration`` (see docs/v2/09).
+TRANSFER_V2_VALIDATE = (os.getenv("TRANSFER_V2_VALIDATE") or "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
 SESSION = os.getenv("RUBIKA_SESSION", "rubika_session").strip()
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -540,6 +548,12 @@ def process_task(task: dict):
         task_type=task_type,
         session=session_name,
     )
+    if TRANSFER_V2_VALIDATE:
+        from v2.transfer.integration import validate_transfer_task_v2
+
+        ok_v2, reason_v2 = validate_transfer_task_v2(task, fallback_session=SESSION)
+        if not ok_v2:
+            raise RuntimeError(reason_v2)
     part_size_mb = int(task.get("part_size_mb") or DEFAULT_PART_SIZE_MB)
     if requires_global_network(task_type):
         if not is_global_network_available():
