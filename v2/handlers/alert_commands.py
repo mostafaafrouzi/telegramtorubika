@@ -9,7 +9,8 @@ from typing import Any, Callable, Optional
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from v2.alerts import store
-from v2.alerts.poller import compose_alert_body, schedule_label
+from v2.alerts.poller import compose_alert_body, followup_keyboard, schedule_label
+from v2.alerts.store import quake_min_mag
 from v2.core.menu_sections import MenuSection
 from v2.core.msg_format import reply_plain, send_formatted
 from v2.core.upgrade_cta import buy_pro_keyboard
@@ -113,8 +114,8 @@ def _format_alert_line(r: dict[str, Any], *, lang: str) -> str:
     asset = r.get("asset") or "-"
     sched = schedule_label(r, lang=lang)
     extra = ""
-    if kind == "quake" and r.get("spike_pct") is not None:
-        extra = f" · ≥{float(r['spike_pct']):g}"
+    if kind == "quake":
+        extra = f" · ≥{quake_min_mag(r):g}"
     elif r.get("spike_pct") is not None:
         extra = f" · ≥{float(r['spike_pct']):g}%"
     muted = float(r.get("muted_until") or 0)
@@ -124,10 +125,11 @@ def _format_alert_line(r: dict[str, Any], *, lang: str) -> str:
 
 def _list_keyboard(rows: list[dict[str, Any]], uid: int, tr: TranslateFn) -> InlineKeyboardMarkup:
     kb_rows: list[list[InlineKeyboardButton]] = []
-    for r in rows[:12]:
+    for r in rows[:10]:
         aid = int(r["id"])
         en = bool(r.get("enabled"))
         tog = tr(uid, "alerts_btn_disable") if en else tr(uid, "alerts_btn_enable")
+        muted = float(r.get("muted_until") or 0) > time.time()
         kb_rows.append(
             [
                 InlineKeyboardButton(tog, callback_data=f"alerttog:{aid}"),
@@ -139,6 +141,25 @@ def _list_keyboard(rows: list[dict[str, Any]], uid: int, tr: TranslateFn) -> Inl
                 ),
             ]
         )
+        if muted:
+            kb_rows.append(
+                [
+                    InlineKeyboardButton(
+                        tr(uid, "alerts_btn_unmute"), callback_data=f"alertmute:{aid}:0"
+                    )
+                ]
+            )
+        else:
+            kb_rows.append(
+                [
+                    InlineKeyboardButton(
+                        tr(uid, "alerts_btn_mute_24h"), callback_data=f"alertmute:{aid}:24"
+                    ),
+                    InlineKeyboardButton(
+                        tr(uid, "alerts_btn_mute_7d"), callback_data=f"alertmute:{aid}:168"
+                    ),
+                ]
+            )
     kb_rows.append(
         [InlineKeyboardButton(tr(uid, "alerts_btn_new"), callback_data="alertkind:menu")]
     )
@@ -155,10 +176,10 @@ async def _reply_list(deps: AlertCommandDeps, message: Message, uid: int, *, edi
     else:
         lang = _lang(deps, uid)
         lines = [deps.tr(uid, "alerts_list_title")]
-        for r in rows[:12]:
+        for r in rows[:10]:
             lines.append(_format_alert_line(r, lang=lang))
-        if len(rows) > 12:
-            lines.append(f"… +{len(rows) - 12}")
+        if len(rows) > 10:
+            lines.append(f"… +{len(rows) - 10}")
         text = "\n".join(lines)
         kb = _list_keyboard(rows, uid, deps.tr)
     if edit:
@@ -477,7 +498,7 @@ async def handle_alert_quake_mag_callback(
         kind="quake",
         asset=str(state.get("alert_asset") or ""),
         schedule=str(state.get("alert_schedule") or "daily"),
-        spike_pct=mag,
+        min_mag=mag,
         hour_tehran=int(state.get("alert_hour") or 9),
     )
     await _after_save(
@@ -494,7 +515,12 @@ async def handle_alert_quake_mag_callback(
 
 
 async def handle_alert_manage_callback(
-    deps: AlertCommandDeps, client: Any, callback_query: Any, action: str, alert_id: int
+    deps: AlertCommandDeps,
+    client: Any,
+    callback_query: Any,
+    action: str,
+    alert_id: int,
+    extra: str | None = None,
 ) -> bool:
     uid = callback_query.from_user.id
     if not deps.is_paid_user(uid):
@@ -520,21 +546,55 @@ async def handle_alert_manage_callback(
         await _reply_list(deps, callback_query.message, uid, edit=True)
         return True
 
+    if action == "mute":
+        try:
+            hours = float(extra) if extra is not None else 24.0
+        except ValueError:
+            hours = 24.0
+        ok = store.mute_alert(uid, alert_id, hours=hours)
+        if not ok:
+            await callback_query.answer(deps.tr(uid, "alerts_not_found"), show_alert=True)
+            return True
+        if hours <= 0:
+            await callback_query.answer(deps.tr(uid, "alerts_unmuted"))
+        elif hours >= 168:
+            await callback_query.answer(deps.tr(uid, "alerts_muted_7d"))
+        else:
+            await callback_query.answer(deps.tr(uid, "alerts_muted_24h"))
+        list_title = deps.tr(uid, "alerts_list_title")
+        body = callback_query.message.text or callback_query.message.caption or ""
+        if body.startswith(list_title) or list_title in body[:120]:
+            await _reply_list(deps, callback_query.message, uid, edit=True)
+        else:
+            row = store.get_alert(uid, alert_id)
+            if row:
+                try:
+                    await callback_query.message.edit_reply_markup(
+                        followup_keyboard(row, lang=_lang(deps, uid))
+                    )
+                except Exception:
+                    pass
+        return True
+
     if action == "test":
         row = store.get_alert(uid, alert_id)
         if not row:
             await callback_query.answer(deps.tr(uid, "alerts_not_found"), show_alert=True)
             return True
         await callback_query.answer(deps.tr(uid, "alerts_test_sending"))
+        lang = _lang(deps, uid)
         try:
-            body, _price, _spike = await compose_alert_body(row, force_schedule=True)
+            body, _price, _spike = await compose_alert_body(
+                row, force_schedule=True, lang=lang
+            )
             if not body:
                 await reply_plain(
                     callback_query.message, deps.tr(uid, "alerts_test_fail", detail="empty")
                 )
                 return True
             prefix = deps.tr(uid, "alerts_test_prefix")
-            await send_formatted(client, uid, f"<i>{prefix}</i>\n\n{body}")
+            kb = followup_keyboard(row, lang=lang)
+            await send_formatted(client, uid, f"<i>{prefix}</i>\n\n{body}", reply_markup=kb)
         except Exception as e:
             await reply_plain(
                 callback_query.message,

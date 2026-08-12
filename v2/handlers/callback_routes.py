@@ -247,15 +247,16 @@ async def dispatch_callback_route(client: Any, callback_query: Any, deps: Callba
             client, callback_query, data.split(":", 1)[1]
         )
 
-    if data.startswith(("alertdel:", "alerttog:", "alerttest:")) and deps.handle_alert_manage_callback:
+    if data.startswith(("alertdel:", "alerttog:", "alerttest:", "alertmute:")) and deps.handle_alert_manage_callback:
+        parts = data.split(":")
         try:
-            action, aid_s = data.split(":", 1)
-            action = action.replace("alert", "")
-            aid = int(aid_s)
-        except ValueError:
+            action = parts[0].replace("alert", "", 1)
+            aid = int(parts[1])
+        except (ValueError, IndexError):
             return False
+        extra = parts[2] if len(parts) > 2 else None
         return await deps.handle_alert_manage_callback(
-            client, callback_query, action, aid
+            client, callback_query, action, aid, extra
         )
 
     if data.startswith("feedview:"):

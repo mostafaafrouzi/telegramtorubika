@@ -826,6 +826,12 @@ I18N = {
         "alerts_btn_test": "🧪 تست",
         "alerts_btn_list": "📋 لیست",
         "alerts_btn_new": "➕ هشدار جدید",
+        "alerts_btn_mute_24h": "🔇 ۲۴س",
+        "alerts_btn_mute_7d": "🔇 ۷روز",
+        "alerts_btn_unmute": "🔔 لغو سکوت",
+        "alerts_muted_24h": "۲۴ ساعت سکوت شد",
+        "alerts_muted_7d": "۷ روز سکوت شد",
+        "alerts_unmuted": "سکوت برداشته شد",
         "alerts_deleted": "حذف شد",
         "alerts_not_found": "هشدار پیدا نشد",
         "alerts_enabled": "فعال شد",
@@ -1873,6 +1879,12 @@ I18N = {
         "alerts_btn_test": "🧪 Test",
         "alerts_btn_list": "📋 List",
         "alerts_btn_new": "➕ New alert",
+        "alerts_btn_mute_24h": "🔇 24h",
+        "alerts_btn_mute_7d": "🔇 7d",
+        "alerts_btn_unmute": "🔔 Unmute",
+        "alerts_muted_24h": "Muted 24h",
+        "alerts_muted_7d": "Muted 7 days",
+        "alerts_unmuted": "Unmuted",
         "alerts_deleted": "Deleted",
         "alerts_not_found": "Alert not found",
         "alerts_enabled": "Enabled",
@@ -3818,7 +3830,7 @@ async def payment_notify_loop():
 
 async def alert_poll_loop():
     from v2.alerts.poller import alert_poll_loop as _loop
-    await _loop(app, is_paid=_is_paid_user, interval=120.0)
+    await _loop(app, is_paid=_is_paid_user, interval=120.0, get_lang=get_lang)
 
 
 async def rss_poll_loop():
@@ -5803,8 +5815,8 @@ CALLBACK_ROUTE_DEPS = CallbackRouteDeps(
     handle_alert_schedule_callback=lambda c, cq, s: handle_alert_schedule_callback(ALERT_COMMAND_DEPS, c, cq, s),
     handle_alert_hour_callback=lambda c, cq, h: handle_alert_hour_callback(ALERT_COMMAND_DEPS, c, cq, h),
     handle_alert_spike_callback=lambda c, cq, s: handle_alert_spike_callback(ALERT_COMMAND_DEPS, c, cq, s),
-    handle_alert_manage_callback=lambda c, cq, a, i: handle_alert_manage_callback(
-        ALERT_COMMAND_DEPS, c, cq, a, i
+    handle_alert_manage_callback=lambda c, cq, a, i, e=None: handle_alert_manage_callback(
+        ALERT_COMMAND_DEPS, c, cq, a, i, e
     ),
     handle_market_page_callback=lambda c, cq, b, p: handle_market_page_callback(
         WORLD_COMMAND_DEPS, c, cq, b, p

@@ -53,6 +53,17 @@ def _conn() -> sqlite3.Connection:
         c.execute(
             "ALTER TABLE alert_subscriptions ADD COLUMN muted_until REAL NOT NULL DEFAULT 0"
         )
+    if "min_mag" not in cols:
+        c.execute("ALTER TABLE alert_subscriptions ADD COLUMN min_mag REAL")
+        # Legacy quake alerts stored Richter in spike_pct — move once.
+        c.execute(
+            """
+            UPDATE alert_subscriptions
+            SET min_mag = spike_pct, spike_pct = NULL
+            WHERE kind = 'quake' AND spike_pct IS NOT NULL
+              AND (min_mag IS NULL)
+            """
+        )
     c.execute(
         "CREATE INDEX IF NOT EXISTS idx_alerts_user ON alert_subscriptions(user_id, enabled)"
     )
@@ -76,6 +87,7 @@ def add_alert(
     asset: str,
     schedule: str = "daily",
     spike_pct: Optional[float] = None,
+    min_mag: Optional[float] = None,
     hour_tehran: Optional[int] = None,
 ) -> tuple[bool, str, int]:
     kind = (kind or "").lower().strip()
@@ -87,23 +99,31 @@ def add_alert(
     if count_user(user_id) >= 20:
         return False, "limit", 0
     hour = _default_hour() if hour_tehran is None else max(0, min(23, int(hour_tehran)))
+    spike_val = float(spike_pct) if spike_pct is not None else None
+    mag_val = float(min_mag) if min_mag is not None else None
+    if kind == "quake":
+        # Richter lives in min_mag only
+        if mag_val is None and spike_val is not None:
+            mag_val = spike_val
+        spike_val = None
     conn = _conn()
     with conn:
         cur = conn.execute(
             """
             INSERT INTO alert_subscriptions
             (user_id, kind, asset, schedule, spike_pct, enabled, last_sent_at,
-             created_at, hour_tehran, muted_until)
-            VALUES (?,?,?,?,?,1,0,?,?,0)
+             created_at, hour_tehran, muted_until, min_mag)
+            VALUES (?,?,?,?,?,1,0,?,?,0,?)
             """,
             (
                 int(user_id),
                 kind,
                 (asset or "").strip()[:120],
                 schedule,
-                float(spike_pct) if spike_pct is not None else None,
+                spike_val,
                 time.time(),
                 hour,
+                mag_val,
             ),
         )
         aid = int(cur.lastrowid or 0)
@@ -163,7 +183,8 @@ def toggle_enabled(user_id: int, alert_id: int) -> Optional[bool]:
 
 
 def mute_alert(user_id: int, alert_id: int, hours: float = 24.0) -> bool:
-    until = time.time() + max(0.0, float(hours)) * 3600.0
+    """Mute for N hours; hours<=0 clears mute."""
+    until = 0.0 if float(hours) <= 0 else time.time() + float(hours) * 3600.0
     conn = _conn()
     with conn:
         cur = conn.execute(
@@ -172,6 +193,25 @@ def mute_alert(user_id: int, alert_id: int, hours: float = 24.0) -> bool:
         )
     conn.close()
     return cur.rowcount > 0
+
+
+def unmute_alert(user_id: int, alert_id: int) -> bool:
+    return mute_alert(user_id, alert_id, hours=0)
+
+
+def quake_min_mag(row: dict[str, Any], default: float = 4.5) -> float:
+    """Resolve Richter threshold (prefers min_mag; falls back to legacy spike_pct)."""
+    if row.get("min_mag") is not None:
+        try:
+            return float(row["min_mag"])
+        except (TypeError, ValueError):
+            pass
+    if (row.get("kind") or "") == "quake" and row.get("spike_pct") is not None:
+        try:
+            return float(row["spike_pct"])
+        except (TypeError, ValueError):
+            pass
+    return float(default)
 
 
 def _tehran_now(ts: Optional[float] = None) -> datetime:
