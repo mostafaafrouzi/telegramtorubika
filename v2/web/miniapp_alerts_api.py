@@ -42,6 +42,7 @@ def _serialize_alert(row: dict[str, Any]) -> dict[str, Any]:
         "spike_pct": row.get("spike_pct"),
         "min_mag": row.get("min_mag"),
         "muted_until": float(row.get("muted_until") or 0),
+        "trigger": row.get("trigger") or "schedule",
     }
     if kind == "quake":
         out["min_mag"] = quake_min_mag(row)

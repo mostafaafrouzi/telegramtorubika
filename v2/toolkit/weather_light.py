@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 import requests
 
@@ -255,7 +255,12 @@ def air_quality_report(city: str, *, lang: str = "fa") -> tuple[bool, str]:
         return False, str(e)[:400]
 
 
-def recent_earthquakes(limit: int = 8, *, min_mag: float = 4.5, lang: str = "fa") -> tuple[bool, str]:
+def fetch_earthquake_events(
+    *,
+    min_mag: float = 4.0,
+    limit: int = 40,
+) -> tuple[bool, list[dict[str, Any]]]:
+    """Return recent USGS events as dicts: id, mag, place, when, lat, lon, depth_km."""
     try:
         r = requests.get(
             "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/all_day.geojson",
@@ -263,7 +268,7 @@ def recent_earthquakes(limit: int = 8, *, min_mag: float = 4.5, lang: str = "fa"
         )
         r.raise_for_status()
         feats = r.json().get("features") or []
-        rows = []
+        out: list[dict[str, Any]] = []
         for f in feats:
             p = f.get("properties") or {}
             g = (f.get("geometry") or {}).get("coordinates") or []
@@ -273,56 +278,63 @@ def recent_earthquakes(limit: int = 8, *, min_mag: float = 4.5, lang: str = "fa"
                 continue
             if mag < float(min_mag):
                 continue
+            eid = str(f.get("id") or p.get("code") or "")
+            if not eid:
+                continue
             ts = p.get("time")
             when = "—"
             if ts:
                 try:
-                    when = datetime.utcfromtimestamp(int(ts) / 1000).strftime("%Y-%m-%d %H:%M UTC")
+                    when = datetime.utcfromtimestamp(int(ts) / 1000).strftime(
+                        "%Y-%m-%d %H:%M UTC"
+                    )
                 except Exception:
                     when = str(ts)
+            lon = g[0] if len(g) >= 1 else None
+            lat = g[1] if len(g) >= 2 else None
             depth = g[2] if len(g) >= 3 else None
-            depth_s = f"{depth:.0f} km" if isinstance(depth, (int, float)) else "—"
-            rows.append((mag, p.get("place") or "?", when, depth_s))
-            if len(rows) >= limit:
+            out.append(
+                {
+                    "id": eid,
+                    "mag": mag,
+                    "place": p.get("place") or "?",
+                    "when": when,
+                    "lat": lat,
+                    "lon": lon,
+                    "depth_km": depth,
+                    "ts": int(ts) if ts else 0,
+                }
+            )
+            if len(out) >= limit:
                 break
-        if not rows:
-            r2 = requests.get(
-                "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/significant_day.geojson",
-                timeout=12,
-            )
-            r2.raise_for_status()
-            for f in (r2.json().get("features") or [])[:limit]:
-                p = f.get("properties") or {}
-                ts = p.get("time")
-                when = "—"
-                if ts:
-                    try:
-                        when = datetime.utcfromtimestamp(int(ts) / 1000).strftime("%Y-%m-%d %H:%M UTC")
-                    except Exception:
-                        pass
-                try:
-                    mag = float(p.get("mag") or 0)
-                except (TypeError, ValueError):
-                    mag = 0.0
-                rows.append((mag, p.get("place") or "?", when, "—"))
-        if not rows:
-            return True, (
-                f"No M≥{min_mag} quakes in the last 24 hours."
-                if lang == "en"
-                else f"زلزلهٔ M≥{min_mag} در ۲۴ ساعت اخیر ثبت نشد."
-            )
-        rows.sort(key=lambda x: float(x[0] or 0), reverse=True)
-        header = (
-            f"🌍 Earthquakes — last 24h (M≥{min_mag})"
-            if lang == "en"
-            else f"🌍 زلزله‌ها — ۲۴ ساعت اخیر (M≥{min_mag})"
-        )
-        lines = [header, ""]
-        depth_lbl = "depth" if lang == "en" else "عمق"
-        for mag, place, when, depth in rows:
-            lines.append(f"• M{mag:.1f} — {place}")
-            lines.append(f"  {when} · {depth_lbl} {depth}")
-            lines.append("")
-        return True, "\n".join(lines).rstrip()
+        out.sort(key=lambda x: float(x.get("ts") or 0), reverse=True)
+        return True, out
     except Exception as e:
-        return False, str(e)[:400]
+        return False, [{"error": str(e)[:400]}]
+
+
+def recent_earthquakes(limit: int = 8, *, min_mag: float = 4.5, lang: str = "fa") -> tuple[bool, str]:
+    ok, events = fetch_earthquake_events(min_mag=min_mag, limit=limit)
+    if not ok:
+        err = events[0].get("error") if events else "error"
+        return False, str(err)
+    if not events:
+        return True, (
+            f"No M≥{min_mag} quakes in the last 24 hours."
+            if lang == "en"
+            else f"زلزلهٔ M≥{min_mag} در ۲۴ ساعت اخیر ثبت نشد."
+        )
+    header = (
+        f"🌍 Earthquakes — last 24h (M≥{min_mag})"
+        if lang == "en"
+        else f"🌍 زلزله‌ها — ۲۴ ساعت اخیر (M≥{min_mag})"
+    )
+    lines = [header, ""]
+    depth_lbl = "depth" if lang == "en" else "عمق"
+    for ev in events:
+        depth = ev.get("depth_km")
+        depth_s = f"{depth:.0f} km" if isinstance(depth, (int, float)) else "—"
+        lines.append(f"• M{ev['mag']:.1f} — {ev['place']}")
+        lines.append(f"  {ev['when']} · {depth_lbl} {depth_s}")
+        lines.append("")
+    return True, "\n".join(lines).rstrip()

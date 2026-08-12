@@ -292,3 +292,36 @@ def hub_text(*, lang: str = "fa") -> str:
         mf.italic(PROVIDER_LABEL_FA),
         mf.line("یک تابلو را انتخاب کن: طلا، دلار، یورو، پوند، ین یا ارزهای مهم"),
     )
+
+
+def asset_label(code: str, *, lang: str = "fa") -> str:
+    labels = _LABELS_EN if lang == "en" else _LABELS_FA
+    return labels.get(code, code)
+
+
+def fx_alert_codes() -> tuple[str, ...]:
+    return (
+        "USD",
+        "EUR",
+        "GBP",
+        "JPY",
+        "USDT",
+        "AED",
+        "TRY",
+        "CNY",
+        "CAD",
+        "CHF",
+        "AUD",
+        "SAR",
+        "SEK",
+        "NOK",
+        "NZD",
+        "KRW",
+        "INR",
+        "IQD",
+        "RUB",
+    )
+
+
+def gold_alert_codes() -> tuple[str, ...]:
+    return BOARDS["gold"][2]

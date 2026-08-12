@@ -55,6 +55,11 @@ class CallbackRouteDeps:
     handle_alert_hour_callback: Callable[..., Awaitable[bool]] | None = None
     handle_alert_spike_callback: Callable[..., Awaitable[bool]] | None = None
     handle_alert_free_callback: Callable[..., Awaitable[bool]] | None = None
+    handle_alert_mode_callback: Callable[..., Awaitable[bool]] | None = None
+    handle_alert_sel_callback: Callable[..., Awaitable[bool]] | None = None
+    handle_alert_qtype_callback: Callable[..., Awaitable[bool]] | None = None
+    handle_alert_geo_callback: Callable[..., Awaitable[bool]] | None = None
+    handle_alert_geopage_callback: Callable[..., Awaitable[bool]] | None = None
     handle_alert_manage_callback: Callable[..., Awaitable[bool]] | None = None
     handle_market_page_callback: Callable[..., Awaitable[bool]] | None = None
     handle_quake_mag_callback: Callable[..., Awaitable[bool]] | None = None
@@ -233,6 +238,31 @@ async def dispatch_callback_route(client: Any, callback_query: Any, deps: Callba
             client, callback_query, data.split(":", 1)[1]
         )
 
+    if data.startswith("alertmode:") and deps.handle_alert_mode_callback:
+        return await deps.handle_alert_mode_callback(
+            client, callback_query, data.split(":", 1)[1]
+        )
+
+    if data.startswith("alertsel:") and deps.handle_alert_sel_callback:
+        return await deps.handle_alert_sel_callback(
+            client, callback_query, data.split(":", 1)[1]
+        )
+
+    if data.startswith("alertqtype:") and deps.handle_alert_qtype_callback:
+        return await deps.handle_alert_qtype_callback(
+            client, callback_query, data.split(":", 1)[1]
+        )
+
+    if data.startswith("alertgeopage:") and deps.handle_alert_geopage_callback:
+        return await deps.handle_alert_geopage_callback(
+            client, callback_query, data.split(":", 1)[1]
+        )
+
+    if data.startswith("alertgeo:") and deps.handle_alert_geo_callback:
+        return await deps.handle_alert_geo_callback(
+            client, callback_query, data.split(":", 1)[1]
+        )
+
     if data.startswith("alertsch:") and deps.handle_alert_schedule_callback:
         return await deps.handle_alert_schedule_callback(
             client, callback_query, data.split(":", 1)[1]
@@ -253,7 +283,9 @@ async def dispatch_callback_route(client: Any, callback_query: Any, deps: Callba
             client, callback_query, data.split(":", 1)[1]
         )
 
-    if data.startswith(("alertdel:", "alerttog:", "alerttest:", "alertmute:")) and deps.handle_alert_manage_callback:
+    if data.startswith(
+        ("alertdel:", "alerttog:", "alerttest:", "alertmute:", "alertm:")
+    ) and deps.handle_alert_manage_callback:
         parts = data.split(":")
         try:
             action = parts[0].replace("alert", "", 1)
