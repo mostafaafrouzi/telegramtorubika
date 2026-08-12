@@ -30,10 +30,20 @@ def _q(params: dict[str, list[str]], key: str) -> str:
     return (vals[0] if vals else "").strip()
 
 
-def _json_response(ok: bool, *, text: str = "", error: str = "", http: int | None = None) -> tuple[int, bytes]:
+def _json_response(
+    ok: bool,
+    *,
+    text: str = "",
+    error: str = "",
+    http: int | None = None,
+    data: Any = None,
+) -> tuple[int, bytes]:
     body: dict[str, Any] = {"ok": ok}
     if ok:
-        body["text"] = text
+        if text:
+            body["text"] = text
+        if data is not None:
+            body["data"] = data
     else:
         body["error"] = error or text or "error"
     raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -159,6 +169,19 @@ def dispatch_miniapp_api(path: str, query_string: str) -> tuple[int, str, bytes]
         text = f"{rtype} (server resolve) {host}\n{detail}" if ok else detail
         status, body = _json_response(ok, text=text if ok else "", error=detail if not ok else "")
         return status, "application/json; charset=utf-8", body
+
+    if action.startswith("alerts_"):
+        from v2.web.miniapp_alerts_api import handle_alerts_action
+
+        result = handle_alerts_action(
+            action,
+            q=lambda k: _q(params, k),
+            auth_detail=auth_detail,
+            json_response=_json_response,
+        )
+        if result is not None:
+            status, body = result
+            return status, "application/json; charset=utf-8", body
 
     err = json.dumps({"ok": False, "error": "unknown_action"}).encode("utf-8")
     return 404, "application/json; charset=utf-8", err

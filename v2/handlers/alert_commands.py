@@ -6,12 +6,13 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
 
-from v2.alerts import store
+from v2.alerts import free_digest, store
 from v2.alerts.poller import compose_alert_body, followup_keyboard, schedule_label
 from v2.alerts.store import quake_min_mag
 from v2.core.menu_sections import MenuSection
+from v2.core.miniapp_urls import miniapp_page_url
 from v2.core.msg_format import reply_plain, send_formatted
 from v2.core.upgrade_cta import buy_pro_keyboard
 
@@ -31,6 +32,7 @@ class AlertCommandDeps:
     get_state: Callable[[int], dict]
     is_paid_user: IsPaidFn
     get_lang: Callable[[int], str] = lambda _uid: "fa"
+    miniapp_base_url: str = ""
 
 
 def _lang(deps: AlertCommandDeps, uid: int) -> str:
@@ -38,6 +40,38 @@ def _lang(deps: AlertCommandDeps, uid: int) -> str:
         return "en" if deps.get_lang(uid) == "en" else "fa"
     except Exception:
         return "fa"
+
+
+def _miniapp_alerts_button(deps: AlertCommandDeps, uid: int) -> InlineKeyboardButton | None:
+    url = miniapp_page_url(deps.miniapp_base_url, "alerts.html")
+    if not url:
+        return None
+    return InlineKeyboardButton(
+        deps.tr(uid, "alerts_btn_miniapp"), web_app=WebAppInfo(url=url)
+    )
+
+
+def _free_digest_keyboard(deps: AlertCommandDeps, uid: int) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                deps.tr(uid, "alerts_free_btn_fx"), callback_data="alertfree:fx"
+            ),
+            InlineKeyboardButton(
+                deps.tr(uid, "alerts_free_btn_weather"), callback_data="alertfree:weather"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                deps.tr(uid, "alerts_free_btn_off"), callback_data="alertfree:off"
+            )
+        ],
+    ]
+    rows.extend(buy_pro_keyboard(uid, deps.tr).inline_keyboard)
+    btn = _miniapp_alerts_button(deps, uid)
+    if btn:
+        rows.append([btn])
+    return InlineKeyboardMarkup(rows)
 
 
 def _schedule_kb() -> InlineKeyboardMarkup:
@@ -217,26 +251,31 @@ async def start_alert_wizard(deps: AlertCommandDeps, message: Message) -> None:
     uid = message.from_user.id
     deps.set_menu_section(uid, MenuSection.WORLD)
     if not deps.is_paid_user(uid):
+        sub = free_digest.get_sub(uid)
+        status = free_digest.summarize_sub(sub, lang=_lang(deps, uid))
         await reply_plain(
             message,
-            deps.tr(uid, "alerts_paid_only"),
-            reply_markup=buy_pro_keyboard(uid, deps.tr),
+            deps.tr(uid, "alerts_free_intro", status=status),
+            reply_markup=_free_digest_keyboard(deps, uid),
         )
         return
-    kb = InlineKeyboardMarkup(
+    rows: list[list[InlineKeyboardButton]] = [
         [
-            [
-                InlineKeyboardButton("💵 ارز", callback_data="alertkind:fx"),
-                InlineKeyboardButton("🥇 طلا", callback_data="alertkind:gold"),
-            ],
-            [
-                InlineKeyboardButton("🌤 آب‌وهوا", callback_data="alertkind:weather"),
-                InlineKeyboardButton("🌍 زلزله", callback_data="alertkind:quake"),
-            ],
-            [InlineKeyboardButton("📋 لیست هشدارها", callback_data="alertkind:list")],
-        ]
+            InlineKeyboardButton("💵 ارز", callback_data="alertkind:fx"),
+            InlineKeyboardButton("🥇 طلا", callback_data="alertkind:gold"),
+        ],
+        [
+            InlineKeyboardButton("🌤 آب‌وهوا", callback_data="alertkind:weather"),
+            InlineKeyboardButton("🌍 زلزله", callback_data="alertkind:quake"),
+        ],
+        [InlineKeyboardButton("📋 لیست هشدارها", callback_data="alertkind:list")],
+    ]
+    btn = _miniapp_alerts_button(deps, uid)
+    if btn:
+        rows.append([btn])
+    await reply_plain(
+        message, deps.tr(uid, "alerts_pick_kind"), reply_markup=InlineKeyboardMarkup(rows)
     )
-    await reply_plain(message, deps.tr(uid, "alerts_pick_kind"), reply_markup=kb)
 
 
 async def handle_alert_kind_callback(
@@ -420,6 +459,22 @@ async def dispatch_alert_wizard(
 ) -> bool:
     state = deps.get_state(user_id)
     step = state.get("step")
+    if step == "await_free_weather_city":
+        city = text.strip()
+        if not city:
+            await reply_plain(message, deps.tr(user_id, "alerts_ask_weather_city"))
+            return True
+        ok, err = free_digest.set_sub(user_id, kind="weather", asset=city)
+        deps.clear_state(user_id)
+        if not ok:
+            await reply_plain(message, deps.tr(user_id, "alerts_add_fail", detail=err))
+            return True
+        await reply_plain(
+            message,
+            deps.tr(user_id, "alerts_free_weather_ok", city=city),
+            reply_markup=_free_digest_keyboard(deps, user_id),
+        )
+        return True
     if step == "await_alert_asset":
         asset = text.strip()
         if not asset:
@@ -511,6 +566,42 @@ async def handle_alert_quake_mag_callback(
         ok_key="alerts_quake_added_ok",
         mag=f"{mag:g}",
     )
+    return True
+
+
+async def handle_alert_free_callback(
+    deps: AlertCommandDeps, client: Any, callback_query: Any, action: str
+) -> bool:
+    uid = callback_query.from_user.id
+    await callback_query.answer()
+    if action == "fx":
+        ok, err = free_digest.set_sub(uid, kind="fx", asset="USD")
+        if not ok:
+            await reply_plain(
+                callback_query.message, deps.tr(uid, "alerts_add_fail", detail=err)
+            )
+            return True
+        await reply_plain(
+            callback_query.message,
+            deps.tr(uid, "alerts_free_fx_ok"),
+            reply_markup=_free_digest_keyboard(deps, uid),
+        )
+        return True
+    if action == "weather":
+        deps.set_state_preserving_menu(uid, {"step": "await_free_weather_city"})
+        await reply_plain(
+            callback_query.message, deps.tr(uid, "alerts_ask_weather_city")
+        )
+        return True
+    if action == "off":
+        free_digest.disable_sub(uid)
+        await reply_plain(
+            callback_query.message,
+            deps.tr(uid, "alerts_free_off_ok"),
+            reply_markup=_free_digest_keyboard(deps, uid),
+        )
+        return True
+    await start_alert_wizard(deps, callback_query.message)
     return True
 
 

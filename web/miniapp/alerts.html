@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Alerts</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <link rel="stylesheet" href="common.css" />
+</head>
+<body>
+  <div id="app" class="app-shell">
+    <div id="hdr"></div>
+    <p class="muted" id="hint"></p>
+
+    <div class="card" id="free-card">
+      <h2 id="free-title"></h2>
+      <p class="muted" id="free-status"></p>
+      <div class="btn-row" id="free-actions"></div>
+      <div class="field" id="weather-wrap" style="display:none;margin-top:10px">
+        <label for="city" id="lbl-city"></label>
+        <input id="city" type="text" placeholder="Tehran" />
+        <button type="button" class="btn" id="btn-weather-save" style="margin-top:8px"></button>
+      </div>
+    </div>
+
+    <div class="card" id="pro-card">
+      <h2 id="pro-title"></h2>
+      <div id="pro-list"></div>
+      <p class="muted" id="pro-empty" style="display:none"></p>
+      <div id="test-out" class="result" style="display:none;margin-top:10px"></div>
+    </div>
+  </div>
+  <script src="common.js"></script>
+  <script>
+    T2R.initApp();
+    const en = T2R.lang() === "en";
+    T2R.shell(en ? "Alerts" : "هشدارها", "index.html");
+    document.getElementById("hint").textContent = en
+      ? "Manage free daily digest and Pro alerts."
+      : "مدیریت خلاصه رایگان روزانه و هشدارهای Pro.";
+    document.getElementById("free-title").textContent = en ? "Free daily digest" : "خلاصه رایگان روزانه";
+    document.getElementById("pro-title").textContent = en ? "Pro alerts" : "هشدارهای Pro";
+    document.getElementById("pro-empty").textContent = en
+      ? "No Pro alerts yet. Create them in the bot: /world_alerts"
+      : "هنوز هشدار Pro نداری. در ربات بساز: /world_alerts";
+    document.getElementById("lbl-city").textContent = en ? "City" : "شهر";
+    document.getElementById("btn-weather-save").textContent = en ? "Save weather digest" : "ثبت آب‌وهوا";
+
+    const freeStatus = document.getElementById("free-status");
+    const freeActions = document.getElementById("free-actions");
+    const weatherWrap = document.getElementById("weather-wrap");
+    const proList = document.getElementById("pro-list");
+    const proEmpty = document.getElementById("pro-empty");
+    const testOut = document.getElementById("test-out");
+    let paid = false;
+
+    function kindLabel(k) {
+      const map = en
+        ? { fx: "FX", gold: "Gold", weather: "Weather", quake: "Quake" }
+        : { fx: "ارز", gold: "طلا", weather: "آب‌وهوا", quake: "زلزله" };
+      return map[k] || k;
+    }
+
+    function esc(s) {
+      return String(s || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+    }
+
+    async function api(action, params) {
+      const p = Object.assign({ lang: en ? "en" : "fa" }, params || {});
+      return T2R.miniappApi(action, p);
+    }
+
+    function renderFree(data) {
+      paid = !!(data && data.paid);
+      freeStatus.textContent = (en ? "Status: " : "وضعیت: ") + ((data && data.summary) || "—");
+      freeActions.innerHTML = "";
+      const mk = (label, fn, secondary) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "btn" + (secondary ? " secondary" : "");
+        b.textContent = label;
+        b.onclick = fn;
+        freeActions.appendChild(b);
+      };
+      mk(en ? "Market brief" : "خلاصه بازار", async () => {
+        await api("alerts_free_set", { kind: "fx" });
+        await load();
+      });
+      mk(en ? "Weather…" : "آب‌وهوا…", () => {
+        weatherWrap.style.display = "block";
+      }, true);
+      mk(en ? "Turn off" : "خاموش", async () => {
+        await api("alerts_free_off", {});
+        weatherWrap.style.display = "none";
+        await load();
+      }, true);
+    }
+
+    function renderPro(alerts) {
+      proList.innerHTML = "";
+      if (!paid) {
+        proEmpty.style.display = "block";
+        proEmpty.textContent = en
+          ? "Pro/Star required for advanced alerts. Upgrade in the bot."
+          : "هشدار پیشرفته فقط Pro/Star — از ربات ارتقا بده.";
+        return;
+      }
+      if (!alerts || !alerts.length) {
+        proEmpty.style.display = "block";
+        return;
+      }
+      proEmpty.style.display = "none";
+      alerts.forEach((a) => {
+        const card = document.createElement("div");
+        card.className = "card";
+        card.style.marginTop = "10px";
+        const muted = a.muted_until && a.muted_until * 1000 > Date.now();
+        const extra =
+          a.kind === "quake"
+            ? " · ≥" + (a.min_mag || "?")
+            : a.spike_pct != null
+              ? " · ≥" + a.spike_pct + "%"
+              : "";
+        card.innerHTML =
+          "<div><b>#" +
+          a.id +
+          "</b> · " +
+          esc(kindLabel(a.kind)) +
+          " · " +
+          esc(a.asset || "-") +
+          "<br/><span class='muted'>" +
+          esc(a.schedule) +
+          " " +
+          String(a.hour_tehran).padStart(2, "0") +
+          ":00" +
+          extra +
+          (a.enabled ? "" : en ? " · paused" : " · خاموش") +
+          (muted ? (en ? " · muted" : " · سکوت") : "") +
+          "</span></div>";
+        const row = document.createElement("div");
+        row.className = "btn-row";
+        row.style.marginTop = "8px";
+        const act = (label, fn, secondary) => {
+          const b = document.createElement("button");
+          b.type = "button";
+          b.className = "btn" + (secondary ? " secondary" : "");
+          b.textContent = label;
+          b.onclick = fn;
+          row.appendChild(b);
+        };
+        act(a.enabled ? (en ? "Pause" : "خاموش") : (en ? "Enable" : "روشن"), async () => {
+          await api("alerts_toggle", { id: String(a.id) });
+          await load();
+        }, true);
+        act(en ? "Mute 24h" : "سکوت ۲۴س", async () => {
+          await api("alerts_mute", { id: String(a.id), hours: "24" });
+          await load();
+        }, true);
+        act(en ? "Test" : "تست", async () => {
+          testOut.style.display = "block";
+          T2R.setResult(testOut, T2R.t("loading"), "loading");
+          try {
+            const j = await api("alerts_test", { id: String(a.id) });
+            T2R.setResult(testOut, j.text || "—", "ok");
+          } catch (e) {
+            T2R.setResult(testOut, e.message || String(e), "error");
+          }
+        });
+        act(en ? "Delete" : "حذف", async () => {
+          if (!confirm(en ? "Delete this alert?" : "این هشدار حذف شود؟")) return;
+          await api("alerts_delete", { id: String(a.id) });
+          await load();
+        }, true);
+        card.appendChild(row);
+        proList.appendChild(card);
+      });
+    }
+
+    document.getElementById("btn-weather-save").onclick = async () => {
+      const city = document.getElementById("city").value.trim();
+      if (!city) return;
+      await api("alerts_free_set", { kind: "weather", asset: city });
+      weatherWrap.style.display = "none";
+      await load();
+    };
+
+    async function load() {
+      try {
+        const free = await api("alerts_free_get", {});
+        renderFree(free.data || {});
+      } catch (e) {
+        freeStatus.textContent = e.message || String(e);
+      }
+      try {
+        const list = await api("alerts_list", {});
+        renderPro((list.data && list.data.alerts) || []);
+      } catch (e) {
+        if (String(e.message || e) === "paid_only") {
+          paid = false;
+          renderPro([]);
+        } else {
+          proEmpty.style.display = "block";
+          proEmpty.textContent = e.message || String(e);
+        }
+      }
+    }
+
+    load();
+  </script>
+</body>
+</html>

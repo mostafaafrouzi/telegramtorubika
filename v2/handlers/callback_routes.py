@@ -54,6 +54,7 @@ class CallbackRouteDeps:
     handle_alert_schedule_callback: Callable[..., Awaitable[bool]] | None = None
     handle_alert_hour_callback: Callable[..., Awaitable[bool]] | None = None
     handle_alert_spike_callback: Callable[..., Awaitable[bool]] | None = None
+    handle_alert_free_callback: Callable[..., Awaitable[bool]] | None = None
     handle_alert_manage_callback: Callable[..., Awaitable[bool]] | None = None
     handle_market_page_callback: Callable[..., Awaitable[bool]] | None = None
     handle_quake_mag_callback: Callable[..., Awaitable[bool]] | None = None
@@ -244,6 +245,11 @@ async def dispatch_callback_route(client: Any, callback_query: Any, deps: Callba
 
     if data.startswith("alertspike:") and deps.handle_alert_spike_callback:
         return await deps.handle_alert_spike_callback(
+            client, callback_query, data.split(":", 1)[1]
+        )
+
+    if data.startswith("alertfree:") and deps.handle_alert_free_callback:
+        return await deps.handle_alert_free_callback(
             client, callback_query, data.split(":", 1)[1]
         )
 

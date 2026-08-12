@@ -136,6 +136,7 @@ from v2.handlers.clear_chat_commands import ClearChatDeps, handle_clear_chat_cal
 from v2.handlers.alert_commands import (
     AlertCommandDeps,
     dispatch_alert_wizard,
+    handle_alert_free_callback,
     handle_alert_hour_callback,
     handle_alert_kind_callback,
     handle_alert_manage_callback,
@@ -806,7 +807,7 @@ I18N = {
         "alerts_quake_added_ok": "هشدار زلزله ثبت شد ✅ (حداقل {mag} ریشتر)",
         "clear_chat_none": "پیام قابل حذفی پیدا نشد (بعد از این آپدیت پیام‌های جدید ربات قابل پاک‌سازی‌اند).",
         "btn_world_alerts": "🔔 هشدارها",
-        "alerts_paid_only": "هشدارهای زمان‌بندی فقط برای پلن Pro/Star است.",
+        "alerts_paid_only": "هشدارهای پیشرفته فقط برای پلن Pro/Star است.",
         "alerts_pick_kind": "نوع هشدار را انتخاب کن:",
         "alerts_ask_fx_asset": "کد ارز را بفرست (مثل USD یا EUR):",
         "alerts_ask_gold_asset": "دارایی طلا را بفرست (مثل SEKEE یا GOLD18 یا سکه امامی):",
@@ -839,6 +840,19 @@ I18N = {
         "alerts_test_sending": "در حال ارسال تست…",
         "alerts_test_prefix": "🧪 پیام آزمایشی هشدار",
         "alerts_test_fail": "تست ناموفق: {detail}",
+        "alerts_btn_miniapp": "📱 مدیریت در Mini App",
+        "alerts_free_intro": (
+            "🔔 هشدارها\n\n"
+            "رایگان: یک خلاصه روزانه (بازار یا آب‌وهوا).\n"
+            "وضعیت فعلی: {status}\n\n"
+            "هشدارهای پیشرفته (جهش قیمت، زلزله، زمان‌بندی چندگانه) فقط Pro/Star."
+        ),
+        "alerts_free_btn_fx": "☀️ خلاصه بازار",
+        "alerts_free_btn_weather": "🌤 آب‌وهوا",
+        "alerts_free_btn_off": "❌ خاموش کردن رایگان",
+        "alerts_free_fx_ok": "خلاصه روزانه بازار فعال شد ✅ (حدود ساعت ۹ تهران).",
+        "alerts_free_weather_ok": "آب‌وهوای روزانه برای «{city}» فعال شد ✅",
+        "alerts_free_off_ok": "خلاصه رایگان خاموش شد.",
         "btn_calc_digits": "۱۲۳ ارقام FA/EN",
         "calc_ask_digits": "متن دارای عدد را بفرست تا ارقام فارسی↔انگلیسی تبدیل شوند:",
         "link_dest_rubika": "روبیکا",
@@ -1859,7 +1873,7 @@ I18N = {
         "alerts_quake_added_ok": "Quake alert saved ✅ (min {mag} Richter)",
         "clear_chat_none": "No deletable bot messages found yet (new bot replies after this update are tracked).",
         "btn_world_alerts": "🔔 Alerts",
-        "alerts_paid_only": "Scheduled alerts are Pro/Star only.",
+        "alerts_paid_only": "Advanced alerts are Pro/Star only.",
         "alerts_pick_kind": "Pick an alert type:",
         "alerts_ask_fx_asset": "Send FX code (e.g. USD or EUR):",
         "alerts_ask_gold_asset": "Send gold asset (e.g. SEKEE or GOLD18):",
@@ -1892,6 +1906,19 @@ I18N = {
         "alerts_test_sending": "Sending test…",
         "alerts_test_prefix": "🧪 Alert test message",
         "alerts_test_fail": "Test failed: {detail}",
+        "alerts_btn_miniapp": "📱 Manage in Mini App",
+        "alerts_free_intro": (
+            "🔔 Alerts\n\n"
+            "Free: one daily digest (market or weather).\n"
+            "Current: {status}\n\n"
+            "Advanced alerts (spikes, quakes, multi-schedule) are Pro/Star only."
+        ),
+        "alerts_free_btn_fx": "☀️ Market brief",
+        "alerts_free_btn_weather": "🌤 Weather",
+        "alerts_free_btn_off": "❌ Turn free digest off",
+        "alerts_free_fx_ok": "Daily market brief enabled ✅ (around 09:00 Tehran).",
+        "alerts_free_weather_ok": "Daily weather for “{city}” enabled ✅",
+        "alerts_free_off_ok": "Free digest turned off.",
         "btn_calc_digits": "123 Digits FA/EN",
         "calc_ask_digits": "Send text with numbers to convert Persian↔English digits:",
         "link_dest_rubika": "Rubika",
@@ -3866,6 +3893,12 @@ async def rss_poll_loop():
             )
         except Exception as e:
             log_event("market_digest_error", error=str(e))
+        try:
+            from v2.alerts.free_digest import maybe_send_free_digests
+
+            await maybe_send_free_digests(app, get_lang=get_lang, log_event=log_event)
+        except Exception as e:
+            log_event("free_digest_error", error=str(e))
 
 
 def _create_stub_purchase_checkout(user_id: int) -> tuple[int, str]:
@@ -3971,6 +4004,7 @@ ALERT_COMMAND_DEPS = AlertCommandDeps(
     get_state=get_state,
     is_paid_user=_is_paid_user,
     get_lang=get_lang,
+    miniapp_base_url=MINIAPP_BASE_URL,
 )
 
 
@@ -5815,6 +5849,7 @@ CALLBACK_ROUTE_DEPS = CallbackRouteDeps(
     handle_alert_schedule_callback=lambda c, cq, s: handle_alert_schedule_callback(ALERT_COMMAND_DEPS, c, cq, s),
     handle_alert_hour_callback=lambda c, cq, h: handle_alert_hour_callback(ALERT_COMMAND_DEPS, c, cq, h),
     handle_alert_spike_callback=lambda c, cq, s: handle_alert_spike_callback(ALERT_COMMAND_DEPS, c, cq, s),
+    handle_alert_free_callback=lambda c, cq, a: handle_alert_free_callback(ALERT_COMMAND_DEPS, c, cq, a),
     handle_alert_manage_callback=lambda c, cq, a, i, e=None: handle_alert_manage_callback(
         ALERT_COMMAND_DEPS, c, cq, a, i, e
     ),
