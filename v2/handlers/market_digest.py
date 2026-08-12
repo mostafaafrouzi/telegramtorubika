@@ -10,8 +10,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from zoneinfo import ZoneInfo
 
-from pyrogram.enums import ParseMode
-
+from v2.core.msg_format import send_formatted
 from v2.toolkit.fx_light import market_digest_brief
 
 _DB = Path(__file__).resolve().parents[2] / "queue" / "market_digest.sqlite3"
@@ -103,10 +102,7 @@ async def maybe_send_market_digest(
         if not ok:
             continue
         try:
-            try:
-                await client.send_message(uid, body, parse_mode=ParseMode.HTML)
-            except Exception:
-                await client.send_message(uid, body, parse_mode=None)
+            await send_formatted(client, uid, body)
             _mark(uid, day_key)
             sent += 1
             log("market_digest_sent", user_id=uid)

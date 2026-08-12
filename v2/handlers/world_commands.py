@@ -6,12 +6,11 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-from pyrogram.enums import ParseMode
 from pyrogram.errors import MessageNotModified
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from v2.toolkit.calendar_light import age_report, calendar_report
-from v2.core.msg_format import reply_html, reply_plain, strip_html
+from v2.core.msg_format import edit_formatted, reply_formatted, reply_html, reply_plain, strip_html
 from v2.toolkit.fx_calculator import calculate_report
 from v2.toolkit import fx_recent
 from v2.toolkit.fx_light import currency_convert, market_quotes_report
@@ -133,33 +132,22 @@ async def handle_markets(
         kb = InlineKeyboardMarkup(rows)
         if edit:
             try:
-                if "<b>" in body:
-                    await message.edit_text(body, parse_mode=ParseMode.HTML, reply_markup=kb)
-                else:
-                    await message.edit_text(
-                        body, parse_mode=ParseMode.DISABLED, reply_markup=kb
-                    )
+                await edit_formatted(message, body, reply_markup=kb)
             except MessageNotModified:
                 pass
             except Exception:
-                if "<b>" in body:
-                    await reply_html(message, body, reply_markup=kb)
-                else:
-                    await reply_plain(message, body, reply_markup=kb)
+                await reply_formatted(message, body, reply_markup=kb)
             return
-        if "<b>" in body:
-            await reply_html(message, body, reply_markup=kb)
-        else:
-            await reply_plain(message, body, reply_markup=kb)
+        await reply_formatted(message, body, reply_markup=kb)
         return
     err = deps.tr(uid, "world_error", detail=body)
     if edit:
         try:
-            await message.edit_text(strip_html(err), parse_mode=ParseMode.DISABLED)
+            await edit_formatted(message, strip_html(err))
             return
         except Exception:
             pass
-    await message.reply_text(err, parse_mode=None)
+    await reply_plain(message, err)
 
 
 async def handle_calendar(deps: WorldCommandDeps, client: Any, message: Message) -> None:
@@ -204,7 +192,10 @@ async def handle_earthquakes(
     )
     if ok:
         _commit_world(deps, uid)
-    await message.reply_text(body if ok else deps.tr(uid, "world_error", detail=body), parse_mode=None)
+    await reply_formatted(
+        message,
+        body if ok else deps.tr(uid, "world_error", detail=body),
+    )
 
 
 async def dispatch_world_wizard(
@@ -236,10 +227,7 @@ async def dispatch_world_wizard(
             _commit_world(deps, user_id)
         deps.clear_state(user_id)
         body = "\n\n".join(parts)
-        if "<b>" in body:
-            await reply_html(message, body)
-        else:
-            await reply_plain(message, body)
+        await reply_formatted(message, body)
         return True
 
     if step == "await_fx_calc":
@@ -316,10 +304,9 @@ async def dispatch_world_wizard(
         if ok:
             _commit_world(deps, user_id)
         deps.clear_state(user_id)
-        if ok and "<b>" in body:
-            await reply_html(message, body)
-        else:
-            await message.reply_text(body if ok else deps.tr(user_id, "world_error", detail=body), parse_mode=None)
+        await reply_formatted(
+            message, body if ok else deps.tr(user_id, "world_error", detail=body)
+        )
         return True
 
     if step == "await_currency_pair":
@@ -348,10 +335,9 @@ async def dispatch_world_wizard(
         if ok:
             _commit_world(deps, user_id)
         deps.clear_state(user_id)
-        if ok and "<b>" in body:
-            await reply_html(message, body)
-        else:
-            await message.reply_text(body if ok else deps.tr(user_id, "world_error", detail=body), parse_mode=None)
+        await reply_formatted(
+            message, body if ok else deps.tr(user_id, "world_error", detail=body)
+        )
         return True
 
     if step == "await_timezone_place":
@@ -366,7 +352,9 @@ async def dispatch_world_wizard(
         if ok:
             _commit_world(deps, user_id)
         deps.clear_state(user_id)
-        await message.reply_text(body if ok else deps.tr(user_id, "world_error", detail=body), parse_mode=None)
+        await reply_formatted(
+            message, body if ok else deps.tr(user_id, "world_error", detail=body)
+        )
         return True
 
     if step == "await_age_date":
@@ -381,7 +369,9 @@ async def dispatch_world_wizard(
         if ok:
             _commit_world(deps, user_id)
         deps.clear_state(user_id)
-        await message.reply_text(body if ok else deps.tr(user_id, "world_error", detail=body), parse_mode=None)
+        await reply_formatted(
+            message, body if ok else deps.tr(user_id, "world_error", detail=body)
+        )
         return True
 
     return False

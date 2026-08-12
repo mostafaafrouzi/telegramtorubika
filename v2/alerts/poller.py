@@ -7,6 +7,7 @@ import logging
 from typing import Any, Callable, Optional
 
 from v2.alerts import store
+from v2.core.msg_format import escape, send_formatted
 from v2.toolkit import fx_light
 from v2.toolkit.fx_calculator import _rial_of
 from v2.toolkit.weather_light import recent_earthquakes, weather_report
@@ -60,12 +61,15 @@ async def process_alerts_once(
                     if pct >= float(spike):
                         force_spike = True
                         body = (
-                            f"🚨 جهش {code}\n"
+                            f"<b>🚨 جهش {escape(code)}</b>\n"
                             f"تغییر ≈ {pct:.2f}% (آستانه {float(spike):g}%)\n"
                             f"قیمت ≈ {price:,.0f} ریال"
                         )
                 if schedule_due and not body:
-                    body = f"🔔 گزارش {code}\nقیمت ≈ {price:,.0f} ریال ({row.get('schedule')})"
+                    body = (
+                        f"<b>🔔 گزارش {escape(code)}</b>\n"
+                        f"قیمت ≈ {price:,.0f} ریال ({escape(row.get('schedule'))})"
+                    )
             elif kind == "weather":
                 if not schedule_due:
                     continue
@@ -73,7 +77,7 @@ async def process_alerts_once(
                 ok, w = await asyncio.to_thread(weather_report, city, lang="fa")
                 if not ok:
                     continue
-                body = f"🌤 آب‌وهوای زمان‌بندی‌شده — {city}\n\n{w}"
+                body = f"<b>🌤 آب‌وهوای زمان‌بندی‌شده — {escape(city)}</b>\n\n{w}"
             elif kind == "quake":
                 if not schedule_due and spike is None:
                     continue
@@ -87,8 +91,9 @@ async def process_alerts_once(
                 if asset and asset not in q and not schedule_due:
                     continue
                 body = (
-                    f"🌍 زلزله (حداقل {min_mag:g} ریشتر)\n"
-                    f"فیلتر مکان: {asset or 'همه'}\n\n{q}"
+                    f"<b>🌍 زلزله (حداقل {escape(f'{min_mag:g}')} ریشتر)</b>\n"
+                    f"فیلتر مکان: {escape(asset or 'همه')}\n\n"
+                    f"{escape(q)}"
                 )
             else:
                 continue
@@ -102,7 +107,7 @@ async def process_alerts_once(
             continue
 
         try:
-            await app.send_message(uid, body)
+            await send_formatted(app, uid, body)
             store.mark_sent(aid, price=price)
             sent += 1
         except Exception as e:

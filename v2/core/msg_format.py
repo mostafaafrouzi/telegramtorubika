@@ -150,3 +150,94 @@ async def reply_plain(message: Any, body: str, *, reply_markup: Any = None) -> A
         body, parse_mode=ParseMode.DISABLED, reply_markup=reply_markup
     )
     return await _track(message, sent)
+
+
+def looks_like_html(body: str) -> bool:
+    s = body or ""
+    return any(
+        tag in s
+        for tag in (
+            "<b>",
+            "</b>",
+            "<i>",
+            "</i>",
+            "<code>",
+            "</code>",
+            "<pre>",
+            "</pre>",
+            "<a ",
+        )
+    )
+
+
+async def send_formatted(
+    client: Any,
+    chat_id: int,
+    body: str,
+    *,
+    reply_markup: Any = None,
+    disable_web_page_preview: bool = True,
+) -> Any:
+    """Send text with HTML when body contains formatter tags; else plain.
+
+    Client default parse mode is DISABLED, so HTML must be explicit or tags show raw.
+    """
+    text = (body or "")[:4090]
+    if looks_like_html(text):
+        try:
+            return await client.send_message(
+                chat_id,
+                text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+                disable_web_page_preview=disable_web_page_preview,
+            )
+        except Exception:
+            return await client.send_message(
+                chat_id,
+                strip_html(text),
+                parse_mode=ParseMode.DISABLED,
+                reply_markup=reply_markup,
+                disable_web_page_preview=disable_web_page_preview,
+            )
+    return await client.send_message(
+        chat_id,
+        text,
+        parse_mode=ParseMode.DISABLED,
+        reply_markup=reply_markup,
+        disable_web_page_preview=disable_web_page_preview,
+    )
+
+
+async def edit_formatted(
+    message: Any,
+    body: str,
+    *,
+    reply_markup: Any = None,
+) -> Any:
+    """Edit message text with auto HTML/plain selection."""
+    text = (body or "")[:4090]
+    if looks_like_html(text):
+        try:
+            return await message.edit_text(
+                text, parse_mode=ParseMode.HTML, reply_markup=reply_markup
+            )
+        except Exception:
+            return await message.edit_text(
+                strip_html(text), parse_mode=ParseMode.DISABLED, reply_markup=reply_markup
+            )
+    return await message.edit_text(
+        text, parse_mode=ParseMode.DISABLED, reply_markup=reply_markup
+    )
+
+
+async def reply_formatted(
+    message: Any,
+    body: str,
+    *,
+    reply_markup: Any = None,
+) -> Any:
+    """Reply with auto HTML/plain; prefer over bare reply_text for toolkit/world bodies."""
+    if looks_like_html(body or ""):
+        return await reply_html(message, body, reply_markup=reply_markup)
+    return await reply_plain(message, body, reply_markup=reply_markup)

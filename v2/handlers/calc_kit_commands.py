@@ -9,7 +9,7 @@ from typing import Any, Callable, Optional
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from v2.core.menu_sections import MenuSection
-from v2.core.msg_format import reply_html
+from v2.core.msg_format import reply_formatted, reply_html, reply_plain
 from v2.toolkit import calc_kit_light as ck
 from v2.toolkit.calendar_light import add_days, convert_date, date_diff
 from v2.toolkit.iran_info_light import national_id_city, plate_lookup
@@ -160,12 +160,9 @@ async def _reply_result(deps: CalcKitDeps, message: Message, ok: bool, body: str
     uid = message.from_user.id
     if ok:
         deps.toolkit_quota_commit(uid)
-        if "<b>" in body or "<code>" in body:
-            await reply_html(message, body)
-        else:
-            await message.reply_text(body, parse_mode=None)
+        await reply_formatted(message, body)
     else:
-        await message.reply_text(deps.tr(uid, "calc_error", detail=body), parse_mode=None)
+        await reply_plain(message, deps.tr(uid, "calc_error", detail=body))
 
 
 def _eval_from_fields(tool: str, fields: dict[str, str]) -> tuple[bool, str]:
